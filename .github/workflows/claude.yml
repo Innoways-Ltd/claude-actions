@@ -1,0 +1,714 @@
+name: Claude (reusable — local execution)
+
+# Reusable workflow that handles two modes:
+#   - claude:wiki  → read-only Q&A, posts an issue comment with a Mermaid flowchart
+#   - claude:fix   → full bug-fix flow: modifies code, opens GitLab MR(s)
+#
+# Caller repos provide their own thin claude.yml that triggers on issues +
+# issue_comment, then `uses:` this workflow with the project-specific inputs.
+# See README.md for an onboarding template.
+#
+# A single self-hosted runner pool (label `claude-bot`) serves every project.
+# Per-project concurrency groups (computed from `project_name`) keep same-project
+# jobs serial (avoiding `git reset --hard` races on the shared local clones)
+# while letting different projects run in parallel.
+
+on:
+  workflow_call:
+    inputs:
+      project_name:
+        description: "Used for concurrency group + metrics label (e.g. 'casemanagement', 'membership')"
+        required: true
+        type: string
+      subprojects:
+        description: "Space-separated subproject directory names (e.g. 'membership-api membership-web membership-portal')"
+        required: true
+        type: string
+      project_overview:
+        description: "Multiline text shown under 'Workspace layout' (purpose of the project)"
+        required: true
+        type: string
+      subproject_descriptions:
+        description: "Multiline markdown bullets describing each subproject (one bullet per line)"
+        required: true
+        type: string
+      workspace_root:
+        description: "Absolute path on the runner. Default: /home/user6/innoways-project/<project_name>"
+        required: false
+        type: string
+        default: ''
+      docs_path:
+        description: "Subdir of read-only docs (e.g. 'docs'). Empty = no docs section."
+        required: false
+        type: string
+        default: ''
+      docs_inline:
+        description: "Space-separated doc filenames (under docs_path) to inline in the bug prompt"
+        required: false
+        type: string
+        default: ''
+      gitlab_target_branch:
+        description: "Branch MRs target"
+        required: false
+        type: string
+        default: 'dev'
+      git_clean_exclude:
+        description: "Pattern passed to 'git clean -e' (e.g. '.gitnexus'). Empty = no exclusion."
+        required: false
+        type: string
+        default: ''
+      target_prefix:
+        description: "If set (e.g. 'membership-'), this prefix is added to Target Project values from the issue body when they don't already match a subproject. Lets templates expose short names."
+        required: false
+        type: string
+        default: ''
+      enable_wiki_mode:
+        description: "If false, every request is treated as fix mode (for projects without a wiki template)"
+        required: false
+        type: boolean
+        default: true
+      wiki_timeout_seconds:
+        required: false
+        type: number
+        default: 1200
+      bug_timeout_seconds:
+        required: false
+        type: number
+        default: 1800
+      post_merge_notice:
+        description: "One-line text appended to the MR comment on the source issue (e.g. deploy timing)."
+        required: false
+        type: string
+        default: ''
+      gitnexus_repos:
+        description: "Space-separated repos to mention in the wiki prompt's GitNexus section. Default: same as subprojects. Set to ' ' (one space) to disable."
+        required: false
+        type: string
+        default: ''
+      claude_actions_ref:
+        description: "Ref of Innoways-Ltd/claude-actions to check out for scripts (default: main)"
+        required: false
+        type: string
+        default: 'main'
+
+concurrency:
+  # Per-project group: every project's jobs serialize on its own clones, but
+  # cross-project jobs run in parallel up to the runner-pool size.
+  group: claude-workspace-${{ inputs.project_name }}
+  cancel-in-progress: false
+
+jobs:
+  claude:
+    if: |
+      github.event.sender.login != 'github-actions[bot]' &&
+      (
+        (github.event_name == 'issues' && contains(github.event.issue.body, '@claude')) ||
+        (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude'))
+      )
+    runs-on: [self-hosted, claude-bot]
+    timeout-minutes: 60
+
+    permissions:
+      issues: write
+      contents: read
+
+    env:
+      PROJECT_NAME: ${{ inputs.project_name }}
+      SUBPROJECTS: ${{ inputs.subprojects }}
+      WORKSPACE_ROOT: ${{ inputs.workspace_root != '' && inputs.workspace_root || format('/home/user6/innoways-project/{0}', inputs.project_name) }}
+      DOCS_PATH: ${{ inputs.docs_path }}
+      DOCS_INLINE: ${{ inputs.docs_inline }}
+      GITLAB_TARGET_BRANCH: ${{ inputs.gitlab_target_branch }}
+      GIT_CLEAN_EXCLUDE: ${{ inputs.git_clean_exclude }}
+      TARGET_PREFIX: ${{ inputs.target_prefix }}
+      ENABLE_WIKI_MODE: ${{ inputs.enable_wiki_mode }}
+      WIKI_TIMEOUT: ${{ inputs.wiki_timeout_seconds }}
+      BUG_TIMEOUT: ${{ inputs.bug_timeout_seconds }}
+      POST_MERGE_NOTICE: ${{ inputs.post_merge_notice }}
+      PROJECT_OVERVIEW: ${{ inputs.project_overview }}
+      SUBPROJECT_DESCRIPTIONS: ${{ inputs.subproject_descriptions }}
+      GITNEXUS_REPOS: ${{ inputs.gitnexus_repos }}
+
+    steps:
+      - name: Checkout claude-actions (scripts source)
+        uses: actions/checkout@v4
+        with:
+          repository: Innoways-Ltd/claude-actions
+          ref: ${{ inputs.claude_actions_ref }}
+
+      - name: Ensure claude:* labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+        run: |
+          for state in mr-opened no-change blocked run-failed answered; do
+            gh label create "claude:$state" \
+              --repo "$REPO_FULL" \
+              --description "Auto-set by Claude workflow" \
+              --force >/dev/null 2>&1 || true
+          done
+          # Entry labels (set by issue templates) — make sure they exist.
+          gh label create "claude:fix"  --repo "$REPO_FULL" --description "Bug-fix request"  --force >/dev/null 2>&1 || true
+          gh label create "claude:wiki" --repo "$REPO_FULL" --description "Wiki question"    --force >/dev/null 2>&1 || true
+
+      - name: Helper — compute git clean args
+        id: clean_args
+        run: |
+          if [ -n "$GIT_CLEAN_EXCLUDE" ]; then
+            echo "args=-fd -e $GIT_CLEAN_EXCLUDE" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=-fd" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Determine mode from issue labels and body
+        id: mode
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          # Labels are the primary signal, but GitHub silently drops template
+          # labels that don't yet exist on the repo (chicken-and-egg with the
+          # very first issue). Fall back to body-template markers:
+          #   wiki template renders `### Your question`
+          #   bug template renders  `### Target Project`
+          LABELS=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL" --json labels --jq '.labels[].name' || true)
+          echo "Labels on issue:"
+          printf '%s\n' "$LABELS"
+
+          if [ "$ENABLE_WIKI_MODE" = "false" ]; then
+            MODE=fix
+            REASON="enable_wiki_mode=false in caller workflow"
+          elif echo "$LABELS" | grep -qx 'claude:wiki'; then
+            MODE=wiki
+            REASON="label claude:wiki"
+          elif echo "$LABELS" | grep -qx 'claude:fix'; then
+            MODE=fix
+            REASON="label claude:fix"
+          elif printf '%s' "$BODY" | grep -q '^### Your question'; then
+            MODE=wiki
+            REASON="body has '### Your question' (wiki template)"
+          elif printf '%s' "$BODY" | grep -q '^### Target Project'; then
+            MODE=fix
+            REASON="body has '### Target Project' (bug template)"
+          else
+            MODE=fix
+            REASON="no template marker found, defaulting to fix"
+          fi
+          echo "mode=$MODE" >> "$GITHUB_OUTPUT"
+          echo "Resolved MODE=$MODE ($REASON)"
+
+      # ──────────────────────────────────────────────────────────────────
+      # Shared: fetch issue context + reset all clones to origin/dev
+      # ──────────────────────────────────────────────────────────────────
+
+      - name: Prepare subprojects (clean + pull dev)
+        # Self-heal from leftover state of a previous crashed / killed run:
+        # auto-discard uncommitted changes, force-switch to dev, hard-reset,
+        # and prune leftover `claude/*` branches. The clones are runner-only
+        # workspaces — no human edits should ever live there, so any dirty
+        # state is by definition recoverable.
+        env:
+          CLEAN_ARGS: ${{ steps.clean_args.outputs.args }}
+        run: |
+          set -euo pipefail
+          for sub in $SUBPROJECTS; do
+            cd "$WORKSPACE_ROOT/${sub}"
+            if ! git diff-index --quiet HEAD -- || [ -n "$(git status --porcelain)" ]; then
+              echo "::warning::${sub} had dirty working tree — auto-cleaning:"
+              git status --short || true
+              git checkout -- . || true
+              git clean $CLEAN_ARGS || true
+            fi
+            git fetch origin
+            git checkout "$GITLAB_TARGET_BRANCH"
+            git reset --hard "origin/$GITLAB_TARGET_BRANCH"
+            git clean $CLEAN_ARGS
+            # Prune leftover claude/* branches from prior failed runs (already
+            # pushed to GitLab, safe to drop locally).
+            for stale in $(git for-each-ref --format='%(refname:short)' refs/heads/claude 2>/dev/null); do
+              if [ "$stale" != "$(git rev-parse --abbrev-ref HEAD)" ]; then
+                echo "::notice::pruning leftover branch ${sub}:$stale"
+                git branch -D "$stale" || true
+              fi
+            done
+            echo "${sub}: $(git rev-parse --short HEAD)"
+          done
+
+      - name: Fetch issue context (body + all comments)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/claude-job
+          gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL" --json title,body,comments \
+            > /tmp/claude-job/issue.json
+          echo "Fetched issue #$ISSUE_NUMBER ($(jq -r '.comments | length' /tmp/claude-job/issue.json) comments)"
+
+      # ══════════════════════════════════════════════════════════════════
+      # WIKI PATH
+      # ══════════════════════════════════════════════════════════════════
+
+      - name: Build wiki prompt
+        if: steps.mode.outputs.mode == 'wiki'
+        env:
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/build-wiki-prompt.py" > /tmp/claude-job/prompt.md
+          echo "Prompt size: $(wc -c < /tmp/claude-job/prompt.md) bytes"
+          echo "----- Prompt preview (first 40 lines) -----"
+          head -40 /tmp/claude-job/prompt.md
+
+      - name: Run Claude (wiki — read-only Q&A)
+        if: steps.mode.outputs.mode == 'wiki'
+        id: run_wiki
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CLEAN_ARGS: ${{ steps.clean_args.outputs.args }}
+        run: |
+          set -euo pipefail
+          cd "$WORKSPACE_ROOT"
+          PROMPT=$(cat /tmp/claude-job/prompt.md)
+          # Wiki mode is read-only by INSTRUCTION; we still use bypassPermissions
+          # so Read/Grep don't prompt under no-TTY. The post-step verifies no
+          # files were modified and reverts if Claude misbehaves.
+          set +e
+          timeout "$WIKI_TIMEOUT" claude -p "$PROMPT" \
+            --permission-mode bypassPermissions \
+            --output-format text > /tmp/claude-job/output.log 2>&1
+          EXIT=$?
+          set -e
+          echo "Claude exit: $EXIT"
+          echo "----- Last 80 lines of Claude output -----"
+          tail -80 /tmp/claude-job/output.log || true
+
+          if [ "$EXIT" -ne 0 ]; then
+            echo "::error::claude -p (wiki) exited with code $EXIT"
+            # Revert any half-finished edits so the next run is clean.
+            for sub in $SUBPROJECTS; do
+              ( cd "$WORKSPACE_ROOT/${sub}" && git checkout -- . && git clean $CLEAN_ARGS ) || true
+            done
+            REASON="claude -p exited with code $EXIT"
+            if [ "$EXIT" = "124" ]; then
+              REASON="claude -p timed out after ${WIKI_TIMEOUT}s (exit 124)"
+            fi
+            {
+              printf 'Claude wiki run failed: %s.\n\n' "$REASON"
+              printf 'Last 80 lines of output:\n\n'
+              printf '```\n'
+              tail -80 /tmp/claude-job/output.log 2>/dev/null || echo "(no log)"
+              printf '\n```\n\n[Full run log](%s)\n' "$RUN_URL"
+            } > /tmp/claude-job/run-failed.md
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/run-failed.md || true
+            "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" run-failed
+            exit 1
+          fi
+
+      - name: Verify wiki mode made no file changes
+        if: steps.mode.outputs.mode == 'wiki'
+        id: wiki_dirty
+        env:
+          CLEAN_ARGS: ${{ steps.clean_args.outputs.args }}
+        run: |
+          set -euo pipefail
+          DIRTY=0
+          for sub in $SUBPROJECTS; do
+            cd "$WORKSPACE_ROOT/${sub}"
+            if [ -n "$(git status --porcelain)" ]; then
+              echo "::warning::${sub} dirty after wiki run — reverting:"
+              git status --short
+              git checkout -- . || true
+              git clean $CLEAN_ARGS || true
+              DIRTY=1
+            fi
+          done
+          echo "dirty=$DIRTY" >> "$GITHUB_OUTPUT"
+
+      - name: Post wiki answer
+        if: steps.mode.outputs.mode == 'wiki'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          DIRTY: ${{ steps.wiki_dirty.outputs.dirty }}
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/scripts/post-result.sh" wiki_answer "$RUN_URL" "$DIRTY" \
+            > /tmp/claude-job/wiki-comment.md
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/wiki-comment.md
+          "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" answered
+
+      # ══════════════════════════════════════════════════════════════════
+      # FIX PATH (bug report)
+      # ══════════════════════════════════════════════════════════════════
+
+      - name: Determine target repo from issue body
+        if: steps.mode.outputs.mode == 'fix'
+        id: target
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+          RAW=$(printf '%s' "$BODY" | python3 -c "import sys,re; body=sys.stdin.read(); m=re.search(r'###\s+Target Project[^\n]*\n+\s*(\S+)', body); print((m.group(1) if m else '').strip())")
+          if [ -z "$RAW" ]; then
+            echo "::error::Could not find 'Target Project' marker in issue body."
+            exit 1
+          fi
+          # Match strategy:
+          #   1) RAW already matches a subproject name exactly → use it
+          #   2) target_prefix + RAW matches a subproject → prepend prefix
+          #   3) RAW with target_prefix stripped matches → use stripped (legacy short form)
+          TARGET=""
+          for sub in $SUBPROJECTS; do
+            if [ "$RAW" = "$sub" ]; then TARGET="$sub"; break; fi
+          done
+          if [ -z "$TARGET" ] && [ -n "$TARGET_PREFIX" ]; then
+            CANDIDATE="${TARGET_PREFIX}${RAW}"
+            for sub in $SUBPROJECTS; do
+              if [ "$CANDIDATE" = "$sub" ]; then TARGET="$sub"; break; fi
+            done
+          fi
+          if [ -z "$TARGET" ] && [ -n "$TARGET_PREFIX" ]; then
+            STRIPPED="${RAW#$TARGET_PREFIX}"
+            for sub in $SUBPROJECTS; do
+              if [ "$STRIPPED" = "$sub" ]; then TARGET="$sub"; break; fi
+            done
+          fi
+          if [ -z "$TARGET" ]; then
+            echo "::error::Could not match 'Target Project' value '$RAW' to any subproject (expected one of: $SUBPROJECTS, with optional prefix '$TARGET_PREFIX')."
+            exit 1
+          fi
+          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          echo "Resolved target: $TARGET (raw input was '$RAW')"
+
+      - name: Build bug prompt
+        if: steps.mode.outputs.mode == 'fix'
+        env:
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          TARGET: ${{ steps.target.outputs.target }}
+        run: |
+          set -euo pipefail
+          python3 "$GITHUB_WORKSPACE/scripts/build-bug-prompt.py" > /tmp/claude-job/prompt.md
+          echo "Prompt size: $(wc -c < /tmp/claude-job/prompt.md) bytes"
+          echo "----- Prompt preview (first 40 lines) -----"
+          head -40 /tmp/claude-job/prompt.md
+
+      - name: Run Claude across subprojects
+        if: steps.mode.outputs.mode == 'fix'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CLEAN_ARGS: ${{ steps.clean_args.outputs.args }}
+        run: |
+          set -euo pipefail
+          cd "$WORKSPACE_ROOT"
+          PROMPT=$(cat /tmp/claude-job/prompt.md)
+          set +e
+          timeout "$BUG_TIMEOUT" claude -p "$PROMPT" \
+            --permission-mode bypassPermissions \
+            --output-format text > /tmp/claude-job/output.log 2>&1
+          EXIT=$?
+          set -e
+          echo "Claude exit: $EXIT"
+          echo "----- Last 80 lines of Claude output -----"
+          tail -80 /tmp/claude-job/output.log || true
+
+          if [ "$EXIT" -ne 0 ]; then
+            echo "::error::claude -p exited with code $EXIT"
+            for sub in $SUBPROJECTS; do
+              ( cd "$WORKSPACE_ROOT/${sub}" && git checkout -- . && git clean $CLEAN_ARGS ) || true
+            done
+            REASON="claude -p exited with code $EXIT"
+            if [ "$EXIT" = "124" ]; then
+              REASON="claude -p timed out after ${BUG_TIMEOUT}s (exit 124)"
+            fi
+            {
+              printf 'Claude run failed: %s.\n\n' "$REASON"
+              printf 'No MR opened. Last 80 lines of output:\n\n'
+              printf '```\n'
+              tail -80 /tmp/claude-job/output.log 2>/dev/null || echo "(no log)"
+              printf '\n```\n\n[Full run log](%s)\n' "$RUN_URL"
+            } > /tmp/claude-job/run-failed.md
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/run-failed.md || true
+            "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" run-failed
+            exit 1
+          fi
+
+          for sub in $SUBPROJECTS; do
+            echo "----- ${sub} files changed -----"
+            ( cd "$WORKSPACE_ROOT/${sub}" && git status --porcelain ) || true
+          done
+
+      - name: Sensitive-path post-check across subprojects
+        if: steps.mode.outputs.mode == 'fix'
+        id: paths
+        # NOTE: keep this list in sync with build-bug-prompt.py instruction #4.
+        run: |
+          set -euo pipefail
+          BLOCKED=""
+          CHANGED_SUBS=""
+          for sub in $SUBPROJECTS; do
+            cd "$WORKSPACE_ROOT/${sub}"
+            DIFF=$(git status --porcelain | awk '{print $2}')
+            if [ -z "$DIFF" ]; then
+              continue
+            fi
+            CHANGED_SUBS="${CHANGED_SUBS}${sub} "
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              case "$f" in
+                .env*|*/.env*|secrets/*|*/secrets/*|.github/*|.gitlab-ci.yml|.gitlab/*) BLOCKED="${BLOCKED}- ${sub}: $f"$'\n' ;;
+                */migrations/*|migrations/*|schema/*|*/schema/*) BLOCKED="${BLOCKED}- ${sub}: $f"$'\n' ;;
+                controllers/auth/*|*/controllers/auth/*|middleware/auth/*|*/middleware/auth/*|action/login/*|*/action/login/*|*/auth/*|auth/*) BLOCKED="${BLOCKED}- ${sub}: $f"$'\n' ;;
+              esac
+            done <<< "$DIFF"
+            # Catch any package.json (root or nested), not just the repo root.
+            while IFS= read -r pkg; do
+              [ -z "$pkg" ] && continue
+              BASE_DEPS=$(git show "HEAD:${pkg}" 2>/dev/null | jq -S '.dependencies // {}' 2>/dev/null || echo '{}')
+              HEAD_DEPS=$(jq -S '.dependencies // {}' "$pkg" 2>/dev/null || echo '{}')
+              if [ "$BASE_DEPS" != "$HEAD_DEPS" ]; then
+                BLOCKED="${BLOCKED}- ${sub}: ${pkg} (\`dependencies\` field changed)"$'\n'
+              fi
+            done < <(echo "$DIFF" | grep -E '(^|/)package\.json$' || true)
+          done
+
+          echo "changed_subs=${CHANGED_SUBS% }" >> "$GITHUB_OUTPUT"
+          if [ -n "$BLOCKED" ]; then
+            echo "blocked=true" >> "$GITHUB_OUTPUT"
+            {
+              echo "paths<<__EOF__"
+              printf '%s' "$BLOCKED"
+              echo "__EOF__"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "blocked=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Abort if sensitive paths touched
+        if: steps.mode.outputs.mode == 'fix' && steps.paths.outputs.blocked == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          PATHS: ${{ steps.paths.outputs.paths }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          CLEAN_ARGS: ${{ steps.clean_args.outputs.args }}
+        run: |
+          set -euo pipefail
+          for sub in $SUBPROJECTS; do
+            cd "$WORKSPACE_ROOT/${sub}"
+            git checkout -- . || true
+            git clean $CLEAN_ARGS || true
+          done
+          "$GITHUB_WORKSPACE/scripts/post-result.sh" issue_blocked "$RUN_URL" "$PATHS" > /tmp/claude-job/blocked.md
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/blocked.md
+          "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" blocked
+          exit 1
+
+      - name: Open MR(s) on GitLab — one per modified subproject
+        if: steps.mode.outputs.mode == 'fix' && steps.paths.outputs.blocked != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANGED_SUBS: ${{ steps.paths.outputs.changed_subs }}
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          POST="$GITHUB_WORKSPACE/scripts/post-result.sh"
+          if [ -z "$CHANGED_SUBS" ]; then
+            "$POST" issue_no_chg "$RUN_URL" > /tmp/claude-job/no-change-comment.md
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/no-change-comment.md
+            "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" no-change
+            exit 0
+          fi
+
+          # Shared MR description (same Summary table across all MRs).
+          "$POST" mr_body "$REPO_FULL" "$ISSUE_NUMBER" "$RUN_URL" > /tmp/claude-job/mr-body.md
+
+          STAMP=$(date +%s)
+
+          # ---- Phase 1: branch + commit + push every changed subproject ----
+          PUSHED_SUBS=""
+          PUSH_FAILED=""
+          for sub in $CHANGED_SUBS; do
+            cd "$WORKSPACE_ROOT/${sub}"
+            BRANCH="claude/issue-${ISSUE_NUMBER}-${STAMP}-${sub}"
+            git config user.name "innoways-claude-bot[bot]"
+            git config user.email "innoways-claude-bot@users.noreply.github.com"
+            git checkout -b "$BRANCH"
+            git add -A
+            git commit -m "fix #${ISSUE_NUMBER}: ${ISSUE_TITLE}" -m "Auto-generated by Claude. Source: ${REPO_FULL}#${ISSUE_NUMBER}. Run: ${RUN_URL}"
+            if git push -u origin HEAD 2>/tmp/claude-job/push-${sub}.log; then
+              PUSHED_SUBS="${PUSHED_SUBS}${sub} "
+            else
+              PUSH_FAILED="${PUSH_FAILED}${sub} "
+              echo "::error::git push failed for ${sub}"
+              cat /tmp/claude-job/push-${sub}.log
+              break
+            fi
+          done
+
+          if [ -n "$PUSH_FAILED" ]; then
+            {
+              printf 'Claude run failed: git push failed for **%s**.\n\n' "${PUSH_FAILED% }"
+              if [ -n "$PUSHED_SUBS" ]; then
+                printf 'Branches already pushed (no MR opened, safe to delete):\n'
+                for s in $PUSHED_SUBS; do
+                  printf -- '- `claude/issue-%s-%s-%s` on %s\n' "${ISSUE_NUMBER}" "${STAMP}" "${s}" "${s}"
+                done
+                printf '\n'
+              fi
+              printf 'No MR opened. [Run log](%s)\n' "$RUN_URL"
+            } > /tmp/claude-job/push-failed.md
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/push-failed.md
+            "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" run-failed
+            exit 1
+          fi
+
+          # ---- Phase 2: open one MR per pushed subproject ----
+          MR_LIST=""
+          MR_FAILED=""
+          for sub in $PUSHED_SUBS; do
+            cd "$WORKSPACE_ROOT/${sub}"
+            BRANCH="claude/issue-${ISSUE_NUMBER}-${STAMP}-${sub}"
+            glab mr create \
+              --target-branch "$GITLAB_TARGET_BRANCH" \
+              --source-branch "$BRANCH" \
+              --title "Fix #${ISSUE_NUMBER}: ${ISSUE_TITLE}" \
+              --description "$(cat /tmp/claude-job/mr-body.md)" \
+              --remove-source-branch \
+              --yes > /tmp/claude-job/glab-${sub}.log 2>&1 || true
+            MR_URL=$(grep -Eo 'https://[^ ]+/-/merge_requests/[0-9]+' /tmp/claude-job/glab-${sub}.log | head -1)
+            if [ -z "$MR_URL" ]; then
+              echo "::warning::glab mr create did not return a URL for ${sub}"
+              cat /tmp/claude-job/glab-${sub}.log
+              MR_FAILED="${MR_FAILED}${sub} "
+            else
+              MR_LIST="${MR_LIST}${sub}|${MR_URL}"$'\n'
+            fi
+          done
+
+          # ---- Phase 3: cross-reference MRs (only if 2+ MRs opened) ----
+          MR_COUNT=$(printf '%s' "$MR_LIST" | grep -c '|' || true)
+          if [ "$MR_COUNT" -ge 2 ]; then
+            cp /tmp/claude-job/mr-body.md /tmp/claude-job/mr-body-augmented.md
+            {
+              echo ''
+              echo '---'
+              echo ''
+              echo '**Related MRs from this run — must be merged together:**'
+              echo ''
+              while IFS='|' read -r sub url; do
+                [ -z "$sub" ] && continue
+                printf -- '- `%s` → %s\n' "$sub" "$url"
+              done <<< "$MR_LIST"
+            } >> /tmp/claude-job/mr-body-augmented.md
+            while IFS='|' read -r sub url; do
+              [ -z "$sub" ] && continue
+              MR_NUM=$(echo "$url" | grep -oE '[0-9]+$')
+              cd "$WORKSPACE_ROOT/${sub}"
+              glab mr update "$MR_NUM" \
+                --description "$(cat /tmp/claude-job/mr-body-augmented.md)" \
+                > /tmp/claude-job/glab-update-${sub}.log 2>&1 \
+                || echo "::warning::Failed to add cross-refs to ${sub} MR ${MR_NUM} — see /tmp/claude-job/glab-update-${sub}.log"
+            done <<< "$MR_LIST"
+          fi
+
+          # Single combined GitHub issue comment.
+          printf '%s' "$MR_LIST" > /tmp/claude-job/mr-list.txt
+          if [ -n "$MR_LIST" ]; then
+            "$POST" issue_mr_multi /tmp/claude-job/mr-list.txt > /tmp/claude-job/issue-comment.md
+          else
+            echo '**Claude pushed branches but no MR could be opened on GitLab.**' > /tmp/claude-job/issue-comment.md
+            echo '' >> /tmp/claude-job/issue-comment.md
+          fi
+          if [ -n "$MR_FAILED" ]; then
+            {
+              echo ''
+              echo '> :warning: glab mr create failed for: **'"${MR_FAILED% }"'**'
+              echo '>'
+              echo '> Branches were pushed; admin should open the MR manually or rerun.'
+            } >> /tmp/claude-job/issue-comment.md
+          fi
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/issue-comment.md
+
+          if [ -n "$MR_FAILED" ]; then
+            "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" run-failed
+            exit 1
+          fi
+          "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" mr-opened
+
+      # ──────────────────────────────────────────────────────────────────
+      # Telemetry (always)
+      # ──────────────────────────────────────────────────────────────────
+
+      - name: Record run metrics
+        if: always()
+        env:
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          EVENT_NAME: ${{ github.event_name }}
+          SENDER: ${{ github.event.sender.login }}
+          MODE: ${{ steps.mode.outputs.mode }}
+          TARGET: ${{ steps.target.outputs.target }}
+          CHANGED_SUBS: ${{ steps.paths.outputs.changed_subs }}
+          BLOCKED: ${{ steps.paths.outputs.blocked }}
+          WIKI_DIRTY: ${{ steps.wiki_dirty.outputs.dirty }}
+          JOB_STATUS: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # Append one JSON line per run to /home/user6/claude-runner-logs/metrics.jsonl
+          # for offline analysis. Best-effort — never fails the job.
+          mkdir -p /home/user6/claude-runner-logs || true
+          METRICS=/home/user6/claude-runner-logs/metrics.jsonl
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          OUTPUT_BYTES=0
+          if [ -f /tmp/claude-job/output.log ]; then
+            OUTPUT_BYTES=$(wc -c < /tmp/claude-job/output.log 2>/dev/null || echo 0)
+          fi
+          jq -nc \
+            --arg ts "$NOW" \
+            --arg project "${PROJECT_NAME:-}" \
+            --arg issue "${ISSUE_NUMBER:-0}" \
+            --arg event "${EVENT_NAME:-}" \
+            --arg sender "${SENDER:-}" \
+            --arg mode "${MODE:-}" \
+            --arg target "${TARGET:-}" \
+            --arg changed_subs "${CHANGED_SUBS:-}" \
+            --arg blocked "${BLOCKED:-false}" \
+            --arg wiki_dirty "${WIKI_DIRTY:-0}" \
+            --arg job_status "${JOB_STATUS:-}" \
+            --arg output_bytes "${OUTPUT_BYTES:-0}" \
+            --arg run_url "${RUN_URL:-}" \
+            '{
+              ts: $ts,
+              project: $project,
+              issue: ($issue | tonumber? // 0),
+              event: $event,
+              sender: $sender,
+              mode: $mode,
+              target: $target,
+              changed_subs: $changed_subs,
+              blocked: ($blocked == "true"),
+              wiki_dirty: ($wiki_dirty == "1"),
+              job_status: $job_status,
+              output_bytes: ($output_bytes | tonumber? // 0),
+              run_url: $run_url
+            }' >> "$METRICS" 2>/dev/null || true
+          tail -1 "$METRICS" 2>/dev/null || true
+          true
