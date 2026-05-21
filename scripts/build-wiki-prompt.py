@@ -4,9 +4,10 @@
 Reads /tmp/claude-job/issue.json (output of `gh issue view --json
 title,body,comments`) and prints a markdown prompt to stdout.
 
-Wiki mode is read-only: Claude searches docs/ first, falls back to source
-code, and replies with an explanation plus at least one Mermaid flowchart.
-The workflow extracts the `## Answer` section and posts it as a comment.
+Wiki mode is read-only: Claude relies on the GitNexus MCP code graph
+(with Read/Grep as fallback) and replies with a business-language
+explanation plus at least one Mermaid flowchart. The workflow extracts
+the `## Answer` section and posts it as a comment.
 
 Required env:
   WORKSPACE_ROOT             absolute path to the parent dir on the runner
@@ -16,10 +17,14 @@ Required env:
   ISSUE_NUMBER               GitHub issue number
 
 Optional env:
-  DOCS_PATH                  subdir under WORKSPACE_ROOT (e.g. "docs"); empty = skip
   GITNEXUS_REPOS             space-separated repo names indexed in GitNexus;
-                             defaults to SUBPROJECTS. Set to "" to omit the
-                             GitNexus section entirely.
+                             defaults to SUBPROJECTS. Set to " " (one space)
+                             to omit the GitNexus section entirely.
+
+Note: DOCS_PATH is intentionally NOT read here. Wiki mode no longer
+ingests project docs — GitNexus + Read/Grep cover the same surface and
+the docs/ index inflates the prompt without adding signal. Bug-fix mode
+(build-bug-prompt.py) still reads docs and inlines them for caching.
 """
 import json
 import os
@@ -34,13 +39,6 @@ def env_required(name: str) -> str:
     return val
 
 
-def list_docs(docs_dir: str) -> list[str]:
-    try:
-        return sorted(f for f in os.listdir(docs_dir) if f.endswith(".md"))
-    except (FileNotFoundError, OSError):
-        return []
-
-
 def main() -> int:
     issue_path = "/tmp/claude-job/issue.json"
     if not os.path.exists(issue_path):
@@ -53,11 +51,9 @@ def main() -> int:
     repo = env_required("REPO_FULL")
     issue_num = env_required("ISSUE_NUMBER")
 
-    docs_subpath = os.environ.get("DOCS_PATH", "").strip()
-    docs_dir = os.path.join(workspace_root, docs_subpath) if docs_subpath else ""
-
-    # GITNEXUS_REPOS defaults to SUBPROJECTS. An explicit empty value disables
-    # the GitNexus section so projects without an index don't see it suggested.
+    # GITNEXUS_REPOS defaults to SUBPROJECTS. An explicit ' ' (whitespace)
+    # value parses to an empty list and disables the GitNexus section for
+    # projects without an index.
     raw_gitnexus = os.environ.get("GITNEXUS_REPOS")
     if raw_gitnexus is None:
         gitnexus_repos = subprojects
@@ -78,23 +74,8 @@ def main() -> int:
         "available for **reading only** — do not modify any file:"
     )
     lines.append("")
-    if docs_dir:
-        lines.append(f"- `{docs_subpath}/` — Project documentation (index below)")
     lines.append(subproject_descriptions)
     lines.append("")
-
-    if docs_dir:
-        lines.append(f"## {docs_subpath}/ index")
-        lines.append("")
-        lines.append(
-            "Always start here. Each file documents one module's domain rules, "
-            "state machines and side effects. The numeric prefix is the suggested "
-            "reading order."
-        )
-        lines.append("")
-        for name in list_docs(docs_dir):
-            lines.append(f"- `{docs_subpath}/{name}`")
-        lines.append("")
 
     if gitnexus_repos:
         lines.append("## Code intelligence (GitNexus MCP — preferred)")
@@ -177,19 +158,12 @@ def main() -> int:
         "**what the system does, when, and why**, in plain language."
     )
     lines.append("")
-    if docs_dir:
-        lines.append(
-            f"1. **Research thoroughly, then translate to business language.** "
-            f"Read `{docs_subpath}/` first (numeric prefix = suggested order), then use "
-            "GitNexus MCP tools and Read/Grep to verify your understanding. "
-            "These are for *your* reasoning — the reader never sees them."
-        )
-    else:
-        lines.append(
-            "1. **Research thoroughly, then translate to business language.** "
-            "Use GitNexus MCP tools and Read/Grep to verify your understanding. "
-            "These are for *your* reasoning — the reader never sees them."
-        )
+    lines.append(
+        "1. **Research thoroughly, then translate to business language.** "
+        "Use GitNexus MCP tools as your primary source; fall back to Read/Grep "
+        "on the source tree when the graph is too coarse. These are for *your* "
+        "reasoning — the reader never sees them."
+    )
     lines.append(
         "2. **Do NOT include code paths, file names, function names, "
         "endpoint URLs, class/variable names, or `path:line` references "
