@@ -86,10 +86,10 @@ on:
         type: string
         default: ''
       claude_actions_ref:
-        description: "Ref of Innoways-Ltd/claude-actions to check out for scripts (default: main)"
+        description: "Ref of Innoways-Ltd/claude-actions the runner-local mirror should sync to (default: deployment)"
         required: false
         type: string
-        default: 'main'
+        default: 'deployment'
 
 concurrency:
   # Per-project group: every project's jobs serialize on its own clones, but
@@ -128,13 +128,40 @@ jobs:
       PROJECT_OVERVIEW: ${{ inputs.project_overview }}
       SUBPROJECT_DESCRIPTIONS: ${{ inputs.subproject_descriptions }}
       GITNEXUS_REPOS: ${{ inputs.gitnexus_repos }}
+      # Pinned to the runner-local mirror; the first step keeps it in sync
+      # with origin/${{ inputs.claude_actions_ref }} under flock.
+      SCRIPTS_DIR: /home/user6/claude-actions/scripts
 
     steps:
-      - name: Checkout claude-actions (scripts source)
-        uses: actions/checkout@v4
-        with:
-          repository: Innoways-Ltd/claude-actions
-          ref: ${{ inputs.claude_actions_ref }}
+      # The runner keeps a persistent mirror of this repo at
+      # /home/user6/claude-actions/. We sync it under a flock so concurrent
+      # jobs across projects can't race on the same checkout, then expose
+      # SCRIPTS_DIR so every later step references the runner-local copy
+      # instead of trying to `actions/checkout` a private repo (which the
+      # caller's GITHUB_TOKEN can't read across repo boundaries).
+      - name: Sync runner-local claude-actions mirror
+        id: sync_mirror
+        env:
+          MIRROR: /home/user6/claude-actions
+          REF: ${{ inputs.claude_actions_ref }}
+        run: |
+          set -euo pipefail
+          if [ ! -d "$MIRROR/.git" ]; then
+            echo "::error::Runner-local mirror missing at $MIRROR. Set it up once with:"
+            echo "  git clone --branch deployment https://github.com/Innoways-Ltd/claude-actions.git $MIRROR"
+            exit 1
+          fi
+          # flock serializes mirror updates across the whole runner pool so
+          # one job's `git reset` can't yank scripts mid-read for another job.
+          flock -x /tmp/claude-actions-mirror.lock bash -c "
+            set -euo pipefail
+            cd '$MIRROR'
+            git fetch --quiet origin '$REF'
+            git reset --hard 'origin/$REF' >/dev/null
+          "
+          SCRIPTS_DIR="$MIRROR/scripts"
+          echo "scripts_dir=$SCRIPTS_DIR" >> "$GITHUB_OUTPUT"
+          echo "Using scripts from $SCRIPTS_DIR @ $(git -C "$MIRROR" rev-parse --short HEAD)"
 
       - name: Ensure claude:* labels exist
         env:
@@ -260,7 +287,7 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
-          python3 "$GITHUB_WORKSPACE/scripts/build-wiki-prompt.py" > /tmp/claude-job/prompt.md
+          python3 "$SCRIPTS_DIR/build-wiki-prompt.py" > /tmp/claude-job/prompt.md
           echo "Prompt size: $(wc -c < /tmp/claude-job/prompt.md) bytes"
           echo "----- Prompt preview (first 40 lines) -----"
           head -40 /tmp/claude-job/prompt.md
@@ -309,7 +336,7 @@ jobs:
               printf '\n```\n\n[Full run log](%s)\n' "$RUN_URL"
             } > /tmp/claude-job/run-failed.md
             gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/run-failed.md || true
-            "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" run-failed
+            "$SCRIPTS_DIR/set-issue-label.sh" run-failed
             exit 1
           fi
 
@@ -343,10 +370,10 @@ jobs:
           DIRTY: ${{ steps.wiki_dirty.outputs.dirty }}
         run: |
           set -euo pipefail
-          "$GITHUB_WORKSPACE/scripts/post-result.sh" wiki_answer "$RUN_URL" "$DIRTY" \
+          "$SCRIPTS_DIR/post-result.sh" wiki_answer "$RUN_URL" "$DIRTY" \
             > /tmp/claude-job/wiki-comment.md
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/wiki-comment.md
-          "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" answered
+          "$SCRIPTS_DIR/set-issue-label.sh" answered
 
       # ══════════════════════════════════════════════════════════════════
       # FIX PATH (bug report)
@@ -399,7 +426,7 @@ jobs:
           TARGET: ${{ steps.target.outputs.target }}
         run: |
           set -euo pipefail
-          python3 "$GITHUB_WORKSPACE/scripts/build-bug-prompt.py" > /tmp/claude-job/prompt.md
+          python3 "$SCRIPTS_DIR/build-bug-prompt.py" > /tmp/claude-job/prompt.md
           echo "Prompt size: $(wc -c < /tmp/claude-job/prompt.md) bytes"
           echo "----- Prompt preview (first 40 lines) -----"
           head -40 /tmp/claude-job/prompt.md
@@ -443,7 +470,7 @@ jobs:
               printf '\n```\n\n[Full run log](%s)\n' "$RUN_URL"
             } > /tmp/claude-job/run-failed.md
             gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/run-failed.md || true
-            "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" run-failed
+            "$SCRIPTS_DIR/set-issue-label.sh" run-failed
             exit 1
           fi
 
@@ -514,9 +541,9 @@ jobs:
             git checkout -- . || true
             git clean $CLEAN_ARGS || true
           done
-          "$GITHUB_WORKSPACE/scripts/post-result.sh" issue_blocked "$RUN_URL" "$PATHS" > /tmp/claude-job/blocked.md
+          "$SCRIPTS_DIR/post-result.sh" issue_blocked "$RUN_URL" "$PATHS" > /tmp/claude-job/blocked.md
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/blocked.md
-          "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" blocked
+          "$SCRIPTS_DIR/set-issue-label.sh" blocked
           exit 1
 
       - name: Open MR(s) on GitLab — one per modified subproject
@@ -530,11 +557,11 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -euo pipefail
-          POST="$GITHUB_WORKSPACE/scripts/post-result.sh"
+          POST="$SCRIPTS_DIR/post-result.sh"
           if [ -z "$CHANGED_SUBS" ]; then
             "$POST" issue_no_chg "$RUN_URL" > /tmp/claude-job/no-change-comment.md
             gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/no-change-comment.md
-            "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" no-change
+            "$SCRIPTS_DIR/set-issue-label.sh" no-change
             exit 0
           fi
 
@@ -577,7 +604,7 @@ jobs:
               printf 'No MR opened. [Run log](%s)\n' "$RUN_URL"
             } > /tmp/claude-job/push-failed.md
             gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/push-failed.md
-            "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" run-failed
+            "$SCRIPTS_DIR/set-issue-label.sh" run-failed
             exit 1
           fi
 
@@ -649,10 +676,10 @@ jobs:
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/issue-comment.md
 
           if [ -n "$MR_FAILED" ]; then
-            "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" run-failed
+            "$SCRIPTS_DIR/set-issue-label.sh" run-failed
             exit 1
           fi
-          "$GITHUB_WORKSPACE/scripts/set-issue-label.sh" mr-opened
+          "$SCRIPTS_DIR/set-issue-label.sh" mr-opened
 
       # ──────────────────────────────────────────────────────────────────
       # Telemetry (always)

@@ -13,6 +13,26 @@ opens GitLab MRs (fix mode) or posts a wiki-style answer (wiki mode).
 - Per-project concurrency groups (computed from `project_name`) serialize
   same-project jobs (avoiding clone races) while letting different projects
   run in parallel up to the pool size.
+- This repo is **private**. Since the caller's `GITHUB_TOKEN` cannot read
+  across private-repo boundaries (and `internal` visibility is not available
+  on the org's free plan), the reusable workflow does **not** use
+  `actions/checkout` for its own scripts. Instead, the runner keeps a
+  persistent mirror at `/home/user6/claude-actions/` that is `git fetch`+
+  `git reset --hard` synced under a `flock` at the start of every job.
+
+## One-time runner setup
+
+On every machine where the `claude-bot` runner runs:
+
+```bash
+git clone --branch deployment https://github.com/Innoways-Ltd/claude-actions.git /home/user6/claude-actions
+```
+
+The first step of every job (`Sync runner-local claude-actions mirror`)
+verifies this exists, otherwise it fails fast with instructions. The flock
+at `/tmp/claude-actions-mirror.lock` serializes mirror updates across the
+runner pool so concurrent jobs across projects can't race on the same
+checkout.
 
 ## Onboarding a new project (3 steps)
 
