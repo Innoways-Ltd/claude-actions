@@ -3,7 +3,8 @@
 Reusable GitHub Actions workflow that powers the `@claude` issue bot across every
 Innoways project. Caller repos open issues; this workflow runs `claude -p` on the
 admin's self-hosted runner against local clones of the project's code repos and
-opens GitLab MRs (fix mode) or posts a wiki-style answer (wiki mode).
+commits + pushes directly to the project's `dev` branch (fix / feature mode) or
+posts a wiki-style answer (wiki mode).
 
 ## Architecture
 
@@ -87,7 +88,7 @@ jobs:
       # workspace_root: ''                # default: /home/user6/innoways-project/<project_name>
       # docs_path: ''                     # e.g. 'docs' if the project has a docs/ folder
       # docs_inline: ''                   # e.g. 'README.md 00-architecture.md'
-      # gitlab_target_branch: dev
+      # target_branch: dev
       # git_clean_exclude: ''             # e.g. '.gitnexus' to preserve the GitNexus index
       # target_prefix: ''                 # e.g. 'membership-' if templates use short names
       # enable_wiki_mode: true            # set false if the repo has no wiki template
@@ -110,13 +111,13 @@ jobs:
 | `workspace_root` | | `/home/user6/innoways-project/<project_name>` | Override only if cloned elsewhere |
 | `docs_path` | | (empty) | Subdir of read-only docs; empty → no docs section |
 | `docs_inline` | | (empty) | Doc filenames to inline in the bug prompt (prompt caching) |
-| `gitlab_target_branch` | | `dev` | MR target |
+| `target_branch` | | `dev` | Branch Claude pushes commits to |
 | `git_clean_exclude` | | (empty) | Pattern passed to `git clean -e` |
 | `target_prefix` | | (empty) | Add to / strip from Target Project body values (short-name UX) |
 | `enable_wiki_mode` | | `true` | Set false for fix-only projects |
 | `wiki_timeout_seconds` | | `1200` | Hard timeout on wiki claude runs |
 | `bug_timeout_seconds` | | `1800` | Hard timeout on fix claude runs |
-| `post_merge_notice` | | (empty) | One-line text appended to MR-opened issue comment |
+| `post_merge_notice` | | (empty) | One-line text appended to push-success issue comment |
 | `gitnexus_repos` | | same as subprojects | Repos to mention in wiki prompt's GitNexus section; one space = disable |
 | `claude_actions_ref` | | `main` | Ref of this repo to check out for scripts |
 
@@ -130,15 +131,15 @@ variables (set by the reusable workflow):
 | `build-bug-prompt.py` | Builds the fix-mode prompt (workspace layout + issue body + instructions) |
 | `build-wiki-prompt.py` | Builds the wiki-mode prompt (read-only + Mermaid output spec) |
 | `extract-summary.py` | Extracts the `## Summary` (or `## Answer`) section from Claude's output |
-| `post-result.sh` | Renders GitHub comment / GitLab MR bodies for each terminal state |
+| `post-result.sh` | Renders GitHub issue-comment bodies for each terminal state |
 | `set-issue-label.sh` | Sets a single `claude:*` status label on the source issue |
 
 ## Sensitive paths (security-fixed, not per-project)
 
-The fix-mode post-check refuses to commit any of the following — keep them
-in sync with `build-bug-prompt.py` instruction #4:
+The fix/feature-mode post-check refuses to commit any of the following — keep
+them in sync with `build-bug-prompt.py` / `build-feature-prompt.py` instruction #4:
 
-- `*.env*`, `secrets/**`, `.github/**`, `.gitlab/**`, `.gitlab-ci.yml`
+- `*.env*`, `secrets/**`, `.github/**`
 - `**/migrations/**`, `schema/**`
 - `controllers/auth/**`, `middleware/auth/**`, `action/login/**`, any `**/auth/**`
 - `package.json` `dependencies` field changes

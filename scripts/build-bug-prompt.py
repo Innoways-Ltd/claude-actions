@@ -17,7 +17,7 @@ Required env:
   REPO_FULL                  GitHub repo (owner/name)
   ISSUE_NUMBER               GitHub issue number
   TARGET                     declared Target Project (full subproject name)
-  GITLAB_TARGET_BRANCH       branch MRs target (used in instructions)
+  TARGET_BRANCH              branch Claude pushes commits to (used in instructions)
 
 Optional env:
   DOCS_PATH                  subdir under WORKSPACE_ROOT (e.g. "docs"); empty = skip
@@ -65,7 +65,7 @@ def main() -> int:
     repo = env_required("REPO_FULL")
     issue_num = env_required("ISSUE_NUMBER")
     target = env_required("TARGET")
-    gitlab_target_branch = os.environ.get("GITLAB_TARGET_BRANCH", "dev")
+    target_branch = os.environ.get("TARGET_BRANCH", "dev")
 
     docs_subpath = os.environ.get("DOCS_PATH", "").strip()
     docs_inline = os.environ.get("DOCS_INLINE", "").split()
@@ -91,8 +91,8 @@ def main() -> int:
         f"The Target Project declared above is **{target}**, but you MAY read "
         "AND modify any subproject if the bug requires coordinated changes "
         "(e.g. a frontend request body change paired with a backend handler "
-        "change). The workflow opens one merge request per modified subproject "
-        "automatically."
+        f"change). The workflow commits and pushes one commit per modified "
+        f"subproject directly to the `{target_branch}` branch automatically."
     )
     lines.append("")
 
@@ -172,14 +172,14 @@ def main() -> int:
     # .github/workflows/claude.yml step "Sensitive-path post-check across all
     # subprojects". Drift means Claude either gets blocked without warning, or
     # tries paths it was warned to skip.
-    lines.append("4. **Do NOT modify any of these paths** (MR will be aborted if you do):")
-    lines.append("   - `*.env*`, `secrets/**`, `.github/**`, `.gitlab/**`, `.gitlab-ci.yml`")
+    lines.append("4. **Do NOT modify any of these paths** (push will be aborted if you do):")
+    lines.append("   - `*.env*`, `secrets/**`, `.github/**`")
     lines.append("   - `**/migrations/**`, `schema/**`")
     lines.append("   - `controllers/auth/**`, `middleware/auth/**`, `action/login/**`, any `**/auth/**`")
     lines.append("   - `package.json` `dependencies` field")
     lines.append(
-        f"5. **Do NOT commit, push, or open MRs yourself** — the workflow handles "
-        f"that and opens a merge request on GitLab against the `{gitlab_target_branch}` branch."
+        f"5. **Do NOT commit or push yourself** — the workflow handles that and "
+        f"pushes your changes directly to the `{target_branch}` branch."
     )
     lines.append(
         "6. Run lint where applicable (`npm run lint` or `npx eslint .` for the "
@@ -189,10 +189,10 @@ def main() -> int:
     lines.append(
         "7. **Output a `## Summary` section at the very end of your response.** "
         "The workflow parses this section and posts it as the GitHub issue "
-        "comment and GitLab MR descriptions. Use the exact markdown table "
-        "format below. Write all cell contents in **English** regardless of "
-        "the issue language. The heading `## Summary` and column headers "
-        "must stay as-is so the parser can find them."
+        "comment. Use the exact markdown table format below. Write all cell "
+        "contents in **English** regardless of the issue language. The heading "
+        "`## Summary` and column headers must stay as-is so the parser can "
+        "find them."
     )
     lines.append("")
     lines.append("   ## Summary")
