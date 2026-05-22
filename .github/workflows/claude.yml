@@ -2,9 +2,10 @@ name: Claude (reusable — local execution)
 
 # Reusable workflow that handles three modes:
 #   - claude:wiki     → read-only Q&A, posts an issue comment with a Mermaid flowchart
-#   - claude:fix      → full bug-fix flow: modifies code, opens GitLab MR(s) with `fix #N`
-#   - claude:feature  → full feature-implementation flow: same MR pipeline as fix
-#                       but loads a feature-flavored prompt and uses `feat #N` semantics.
+#   - claude:fix      → full bug-fix flow: modifies code, commits + pushes directly to
+#                       the project's `dev` branch with `fix #N`. No MR step.
+#   - claude:feature  → full feature-implementation flow: same direct-push pipeline as
+#                       fix but loads a feature-flavored prompt and uses `feat #N` semantics.
 #                       Opt-in via `enable_feature_mode: true` in the caller workflow.
 #
 # Caller repos provide their own thin claude.yml that triggers on issues +
@@ -50,8 +51,8 @@ on:
         required: false
         type: string
         default: ''
-      gitlab_target_branch:
-        description: "Branch MRs target"
+      target_branch:
+        description: "Branch Claude pushes commits to"
         required: false
         type: string
         default: 'dev'
@@ -71,7 +72,7 @@ on:
         type: boolean
         default: true
       enable_feature_mode:
-        description: "If true, feature-request issues route to a feature-flavored prompt and 'feat #N' commits/MRs. Default false keeps legacy fix-only behavior."
+        description: "If true, feature-request issues route to a feature-flavored prompt and 'feat #N' commits. Default false keeps legacy fix-only behavior."
         required: false
         type: boolean
         default: false
@@ -84,7 +85,7 @@ on:
         type: number
         default: 1800
       post_merge_notice:
-        description: "One-line text appended to the MR comment on the source issue (e.g. deploy timing)."
+        description: "One-line text appended to the push-success comment on the source issue (e.g. deploy timing)."
         required: false
         type: string
         default: ''
@@ -126,7 +127,7 @@ jobs:
       WORKSPACE_ROOT: ${{ inputs.workspace_root != '' && inputs.workspace_root || format('/home/user6/innoways-project/{0}', inputs.project_name) }}
       DOCS_PATH: ${{ inputs.docs_path }}
       DOCS_INLINE: ${{ inputs.docs_inline }}
-      GITLAB_TARGET_BRANCH: ${{ inputs.gitlab_target_branch }}
+      TARGET_BRANCH: ${{ inputs.target_branch }}
       GIT_CLEAN_EXCLUDE: ${{ inputs.git_clean_exclude }}
       TARGET_PREFIX: ${{ inputs.target_prefix }}
       ENABLE_WIKI_MODE: ${{ inputs.enable_wiki_mode }}
@@ -177,7 +178,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_FULL: ${{ github.repository }}
         run: |
-          for state in mr-opened no-change blocked run-failed answered; do
+          for state in pushed no-change blocked run-failed answered; do
             gh label create "claude:$state" \
               --repo "$REPO_FULL" \
               --description "Auto-set by Claude workflow" \
@@ -270,11 +271,12 @@ jobs:
               git clean $CLEAN_ARGS || true
             fi
             git fetch origin
-            git checkout "$GITLAB_TARGET_BRANCH"
-            git reset --hard "origin/$GITLAB_TARGET_BRANCH"
+            git checkout "$TARGET_BRANCH"
+            git reset --hard "origin/$TARGET_BRANCH"
             git clean $CLEAN_ARGS
-            # Prune leftover claude/* branches from prior failed runs (already
-            # pushed to GitLab, safe to drop locally).
+            # Prune any leftover claude/* branches from the pre-direct-push era
+            # (when each run created a side branch and opened an MR). Cheap
+            # insurance — direct-push no longer creates these locally.
             for stale in $(git for-each-ref --format='%(refname:short)' refs/heads/claude 2>/dev/null); do
               if [ "$stale" != "$(git rev-parse --abbrev-ref HEAD)" ]; then
                 echo "::notice::pruning leftover branch ${sub}:$stale"
@@ -491,7 +493,7 @@ jobs:
             fi
             {
               printf 'Claude run failed: %s.\n\n' "$REASON"
-              printf 'No MR opened. Last 80 lines of output:\n\n'
+              printf 'No commit pushed. Last 80 lines of output:\n\n'
               printf '```\n'
               tail -80 /tmp/claude-job/output.log 2>/dev/null || echo "(no log)"
               printf '\n```\n\n[Full run log](%s)\n' "$RUN_URL"
@@ -524,7 +526,7 @@ jobs:
             while IFS= read -r f; do
               [ -z "$f" ] && continue
               case "$f" in
-                .env*|*/.env*|secrets/*|*/secrets/*|.github/*|.gitlab-ci.yml|.gitlab/*) BLOCKED="${BLOCKED}- ${sub}: $f"$'\n' ;;
+                .env*|*/.env*|secrets/*|*/secrets/*|.github/*) BLOCKED="${BLOCKED}- ${sub}: $f"$'\n' ;;
                 */migrations/*|migrations/*|schema/*|*/schema/*) BLOCKED="${BLOCKED}- ${sub}: $f"$'\n' ;;
                 controllers/auth/*|*/controllers/auth/*|middleware/auth/*|*/middleware/auth/*|action/login/*|*/action/login/*|*/auth/*|auth/*) BLOCKED="${BLOCKED}- ${sub}: $f"$'\n' ;;
               esac
@@ -573,7 +575,7 @@ jobs:
           "$SCRIPTS_DIR/set-issue-label.sh" blocked
           exit 1
 
-      - name: Open MR(s) on GitLab — one per modified subproject
+      - name: Commit & push directly to target branch — one per modified subproject
         if: contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode) && steps.paths.outputs.blocked != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -593,130 +595,60 @@ jobs:
             exit 0
           fi
 
-          # Commit/MR-title prefix: 'feat' for feature mode, 'fix' for bug-fix mode.
           if [ "$MODE" = "feature" ]; then
             COMMIT_PREFIX="feat"
-            TITLE_PREFIX="Feat"
           else
             COMMIT_PREFIX="fix"
-            TITLE_PREFIX="Fix"
           fi
 
-          # Shared MR description (same Summary table across all MRs).
-          "$POST" mr_body "$REPO_FULL" "$ISSUE_NUMBER" "$RUN_URL" > /tmp/claude-job/mr-body.md
-
-          STAMP=$(date +%s)
-
-          # ---- Phase 1: branch + commit + push every changed subproject ----
-          PUSHED_SUBS=""
+          # PUSHED_LIST holds "sub|sha" entries, one per line.
+          PUSHED_LIST=""
           PUSH_FAILED=""
           for sub in $CHANGED_SUBS; do
             cd "$WORKSPACE_ROOT/${sub}"
-            BRANCH="claude/issue-${ISSUE_NUMBER}-${STAMP}-${sub}"
-            git config user.name "innoways-claude-bot[bot]"
+            git config user.name  "innoways-claude-bot[bot]"
             git config user.email "innoways-claude-bot@users.noreply.github.com"
-            git checkout -b "$BRANCH"
+
+            # We're already on $TARGET_BRANCH (set by "Prepare subprojects").
+            # Stage Claude's edits, commit, then rebase onto the latest remote
+            # tip so we fast-forward if a human pushed to the branch mid-run.
             git add -A
-            git commit -m "${COMMIT_PREFIX} #${ISSUE_NUMBER}: ${ISSUE_TITLE}" -m "Auto-generated by Claude. Source: ${REPO_FULL}#${ISSUE_NUMBER}. Run: ${RUN_URL}"
-            if git push -u origin HEAD 2>/tmp/claude-job/push-${sub}.log; then
-              PUSHED_SUBS="${PUSHED_SUBS}${sub} "
+            git commit -m "${COMMIT_PREFIX} #${ISSUE_NUMBER}: ${ISSUE_TITLE}" \
+                       -m "Auto-generated by Claude. Source: ${REPO_FULL}#${ISSUE_NUMBER}. Run: ${RUN_URL}"
+
+            git fetch origin "$TARGET_BRANCH"
+            if ! git rebase "origin/$TARGET_BRANCH"; then
+              git rebase --abort || true
+              PUSH_FAILED="${PUSH_FAILED}${sub}(rebase-conflict) "
+              echo "::error::${sub}: rebase onto origin/$TARGET_BRANCH had conflicts"
+              continue
+            fi
+
+            if git push origin "HEAD:$TARGET_BRANCH" 2>/tmp/claude-job/push-${sub}.log; then
+              SHA=$(git rev-parse --short HEAD)
+              PUSHED_LIST="${PUSHED_LIST}${sub}|${SHA}"$'\n'
             else
-              PUSH_FAILED="${PUSH_FAILED}${sub} "
-              echo "::error::git push failed for ${sub}"
+              PUSH_FAILED="${PUSH_FAILED}${sub}(push-rejected) "
+              echo "::error::git push to ${TARGET_BRANCH} failed for ${sub}"
               cat /tmp/claude-job/push-${sub}.log
-              break
             fi
           done
 
+          printf '%s' "$PUSHED_LIST" > /tmp/claude-job/pushed-list.txt
+
           if [ -n "$PUSH_FAILED" ]; then
-            {
-              printf 'Claude run failed: git push failed for **%s**.\n\n' "${PUSH_FAILED% }"
-              if [ -n "$PUSHED_SUBS" ]; then
-                printf 'Branches already pushed (no MR opened, safe to delete):\n'
-                for s in $PUSHED_SUBS; do
-                  printf -- '- `claude/issue-%s-%s-%s` on %s\n' "${ISSUE_NUMBER}" "${STAMP}" "${s}" "${s}"
-                done
-                printf '\n'
-              fi
-              printf 'No MR opened. [Run log](%s)\n' "$RUN_URL"
-            } > /tmp/claude-job/push-failed.md
+            "$POST" issue_push_failed "$RUN_URL" "${PUSH_FAILED% }" /tmp/claude-job/pushed-list.txt \
+              "$TARGET_BRANCH" \
+              > /tmp/claude-job/push-failed.md
             gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/push-failed.md
             "$SCRIPTS_DIR/set-issue-label.sh" run-failed
             exit 1
           fi
 
-          # ---- Phase 2: open one MR per pushed subproject ----
-          MR_LIST=""
-          MR_FAILED=""
-          for sub in $PUSHED_SUBS; do
-            cd "$WORKSPACE_ROOT/${sub}"
-            BRANCH="claude/issue-${ISSUE_NUMBER}-${STAMP}-${sub}"
-            glab mr create \
-              --target-branch "$GITLAB_TARGET_BRANCH" \
-              --source-branch "$BRANCH" \
-              --title "${TITLE_PREFIX} #${ISSUE_NUMBER}: ${ISSUE_TITLE}" \
-              --description "$(cat /tmp/claude-job/mr-body.md)" \
-              --remove-source-branch \
-              --yes > /tmp/claude-job/glab-${sub}.log 2>&1 || true
-            MR_URL=$(grep -Eo 'https://[^ ]+/-/merge_requests/[0-9]+' /tmp/claude-job/glab-${sub}.log | head -1)
-            if [ -z "$MR_URL" ]; then
-              echo "::warning::glab mr create did not return a URL for ${sub}"
-              cat /tmp/claude-job/glab-${sub}.log
-              MR_FAILED="${MR_FAILED}${sub} "
-            else
-              MR_LIST="${MR_LIST}${sub}|${MR_URL}"$'\n'
-            fi
-          done
-
-          # ---- Phase 3: cross-reference MRs (only if 2+ MRs opened) ----
-          MR_COUNT=$(printf '%s' "$MR_LIST" | grep -c '|' || true)
-          if [ "$MR_COUNT" -ge 2 ]; then
-            cp /tmp/claude-job/mr-body.md /tmp/claude-job/mr-body-augmented.md
-            {
-              echo ''
-              echo '---'
-              echo ''
-              echo '**Related MRs from this run — must be merged together:**'
-              echo ''
-              while IFS='|' read -r sub url; do
-                [ -z "$sub" ] && continue
-                printf -- '- `%s` → %s\n' "$sub" "$url"
-              done <<< "$MR_LIST"
-            } >> /tmp/claude-job/mr-body-augmented.md
-            while IFS='|' read -r sub url; do
-              [ -z "$sub" ] && continue
-              MR_NUM=$(echo "$url" | grep -oE '[0-9]+$')
-              cd "$WORKSPACE_ROOT/${sub}"
-              glab mr update "$MR_NUM" \
-                --description "$(cat /tmp/claude-job/mr-body-augmented.md)" \
-                > /tmp/claude-job/glab-update-${sub}.log 2>&1 \
-                || echo "::warning::Failed to add cross-refs to ${sub} MR ${MR_NUM} — see /tmp/claude-job/glab-update-${sub}.log"
-            done <<< "$MR_LIST"
-          fi
-
-          # Single combined GitHub issue comment.
-          printf '%s' "$MR_LIST" > /tmp/claude-job/mr-list.txt
-          if [ -n "$MR_LIST" ]; then
-            "$POST" issue_mr_multi /tmp/claude-job/mr-list.txt > /tmp/claude-job/issue-comment.md
-          else
-            echo '**Claude pushed branches but no MR could be opened on GitLab.**' > /tmp/claude-job/issue-comment.md
-            echo '' >> /tmp/claude-job/issue-comment.md
-          fi
-          if [ -n "$MR_FAILED" ]; then
-            {
-              echo ''
-              echo '> :warning: glab mr create failed for: **'"${MR_FAILED% }"'**'
-              echo '>'
-              echo '> Branches were pushed; admin should open the MR manually or rerun.'
-            } >> /tmp/claude-job/issue-comment.md
-          fi
+          "$POST" issue_pushed_multi /tmp/claude-job/pushed-list.txt "$TARGET_BRANCH" \
+            > /tmp/claude-job/issue-comment.md
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/issue-comment.md
-
-          if [ -n "$MR_FAILED" ]; then
-            "$SCRIPTS_DIR/set-issue-label.sh" run-failed
-            exit 1
-          fi
-          "$SCRIPTS_DIR/set-issue-label.sh" mr-opened
+          "$SCRIPTS_DIR/set-issue-label.sh" pushed
 
       # ──────────────────────────────────────────────────────────────────
       # Telemetry (always)

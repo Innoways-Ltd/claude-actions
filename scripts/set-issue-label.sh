@@ -10,7 +10,7 @@
 # Usage:
 #   set-issue-label.sh <state>
 #
-# Valid states: mr-opened | no-change | blocked | run-failed | answered
+# Valid states: pushed | no-change | blocked | run-failed | answered
 #
 # Required env: GH_TOKEN, REPO_FULL, ISSUE_NUMBER
 # Best-effort — errors are logged as warnings, not fatal (the workflow's
@@ -20,7 +20,7 @@
 set -uo pipefail
 
 STATE="${1:-}"
-ALL_STATES="mr-opened no-change blocked run-failed answered"
+ALL_STATES="pushed no-change blocked run-failed answered"
 
 case " $ALL_STATES " in
   *" $STATE "*) ;;

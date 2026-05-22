@@ -197,8 +197,8 @@ def main() -> int:
         "Read + Grep + GitNexus MCP only."
     )
     lines.append(
-        "7. **Do NOT commit, push, or open MRs.** The workflow only posts "
-        "your answer as an issue comment."
+        "7. **Do NOT commit or push.** The workflow only posts your answer "
+        "as an issue comment."
     )
     lines.append(
         "8. **Output a `## Answer` section at the very end of your "
