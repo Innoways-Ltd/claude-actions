@@ -1,8 +1,11 @@
 name: Claude (reusable — local execution)
 
-# Reusable workflow that handles two modes:
-#   - claude:wiki  → read-only Q&A, posts an issue comment with a Mermaid flowchart
-#   - claude:fix   → full bug-fix flow: modifies code, opens GitLab MR(s)
+# Reusable workflow that handles three modes:
+#   - claude:wiki     → read-only Q&A, posts an issue comment with a Mermaid flowchart
+#   - claude:fix      → full bug-fix flow: modifies code, opens GitLab MR(s) with `fix #N`
+#   - claude:feature  → full feature-implementation flow: same MR pipeline as fix
+#                       but loads a feature-flavored prompt and uses `feat #N` semantics.
+#                       Opt-in via `enable_feature_mode: true` in the caller workflow.
 #
 # Caller repos provide their own thin claude.yml that triggers on issues +
 # issue_comment, then `uses:` this workflow with the project-specific inputs.
@@ -67,6 +70,11 @@ on:
         required: false
         type: boolean
         default: true
+      enable_feature_mode:
+        description: "If true, feature-request issues route to a feature-flavored prompt and 'feat #N' commits/MRs. Default false keeps legacy fix-only behavior."
+        required: false
+        type: boolean
+        default: false
       wiki_timeout_seconds:
         required: false
         type: number
@@ -122,6 +130,7 @@ jobs:
       GIT_CLEAN_EXCLUDE: ${{ inputs.git_clean_exclude }}
       TARGET_PREFIX: ${{ inputs.target_prefix }}
       ENABLE_WIKI_MODE: ${{ inputs.enable_wiki_mode }}
+      ENABLE_FEATURE_MODE: ${{ inputs.enable_feature_mode }}
       WIKI_TIMEOUT: ${{ inputs.wiki_timeout_seconds }}
       BUG_TIMEOUT: ${{ inputs.bug_timeout_seconds }}
       POST_MERGE_NOTICE: ${{ inputs.post_merge_notice }}
@@ -175,8 +184,9 @@ jobs:
               --force >/dev/null 2>&1 || true
           done
           # Entry labels (set by issue templates) — make sure they exist.
-          gh label create "claude:fix"  --repo "$REPO_FULL" --description "Bug-fix request"  --force >/dev/null 2>&1 || true
-          gh label create "claude:wiki" --repo "$REPO_FULL" --description "Wiki question"    --force >/dev/null 2>&1 || true
+          gh label create "claude:fix"     --repo "$REPO_FULL" --description "Bug-fix request"  --force >/dev/null 2>&1 || true
+          gh label create "claude:wiki"    --repo "$REPO_FULL" --description "Wiki question"    --force >/dev/null 2>&1 || true
+          gh label create "claude:feature" --repo "$REPO_FULL" --description "Feature request"  --force >/dev/null 2>&1 || true
 
       - name: Helper — compute git clean args
         id: clean_args
@@ -199,8 +209,12 @@ jobs:
           # Labels are the primary signal, but GitHub silently drops template
           # labels that don't yet exist on the repo (chicken-and-egg with the
           # very first issue). Fall back to body-template markers:
-          #   wiki template renders `### Your question`
-          #   bug template renders  `### Target Project`
+          #   wiki template renders     `### Your question`
+          #   feature template renders  `### Acceptance criteria` (and `### Target Project`)
+          #   bug template renders      `### Target Project`
+          # Feature checks come before bug checks because the feature template
+          # also has `### Target Project` — checking `### Acceptance criteria`
+          # first disambiguates.
           LABELS=$(gh issue view "$ISSUE_NUMBER" --repo "$REPO_FULL" --json labels --jq '.labels[].name' || true)
           echo "Labels on issue:"
           printf '%s\n' "$LABELS"
@@ -211,12 +225,18 @@ jobs:
           elif echo "$LABELS" | grep -qx 'claude:wiki'; then
             MODE=wiki
             REASON="label claude:wiki"
+          elif [ "$ENABLE_FEATURE_MODE" = "true" ] && echo "$LABELS" | grep -qx 'claude:feature'; then
+            MODE=feature
+            REASON="label claude:feature"
           elif echo "$LABELS" | grep -qx 'claude:fix'; then
             MODE=fix
             REASON="label claude:fix"
           elif printf '%s' "$BODY" | grep -q '^### Your question'; then
             MODE=wiki
             REASON="body has '### Your question' (wiki template)"
+          elif [ "$ENABLE_FEATURE_MODE" = "true" ] && printf '%s' "$BODY" | grep -q '^### Acceptance criteria'; then
+            MODE=feature
+            REASON="body has '### Acceptance criteria' (feature template)"
           elif printf '%s' "$BODY" | grep -q '^### Target Project'; then
             MODE=fix
             REASON="body has '### Target Project' (bug template)"
@@ -376,11 +396,11 @@ jobs:
           "$SCRIPTS_DIR/set-issue-label.sh" answered
 
       # ══════════════════════════════════════════════════════════════════
-      # FIX PATH (bug report)
+      # FIX / FEATURE PATH (code-change requests)
       # ══════════════════════════════════════════════════════════════════
 
       - name: Determine target repo from issue body
-        if: steps.mode.outputs.mode == 'fix'
+        if: contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode)
         id: target
         env:
           BODY: ${{ github.event.issue.body }}
@@ -418,21 +438,28 @@ jobs:
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "Resolved target: $TARGET (raw input was '$RAW')"
 
-      - name: Build bug prompt
-        if: steps.mode.outputs.mode == 'fix'
+      - name: Build code-change prompt
+        if: contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode)
         env:
           REPO_FULL: ${{ github.repository }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           TARGET: ${{ steps.target.outputs.target }}
+          MODE: ${{ steps.mode.outputs.mode }}
         run: |
           set -euo pipefail
-          python3 "$SCRIPTS_DIR/build-bug-prompt.py" > /tmp/claude-job/prompt.md
+          if [ "$MODE" = "feature" ]; then
+            BUILDER="$SCRIPTS_DIR/build-feature-prompt.py"
+          else
+            BUILDER="$SCRIPTS_DIR/build-bug-prompt.py"
+          fi
+          python3 "$BUILDER" > /tmp/claude-job/prompt.md
+          echo "Prompt builder: $BUILDER"
           echo "Prompt size: $(wc -c < /tmp/claude-job/prompt.md) bytes"
           echo "----- Prompt preview (first 40 lines) -----"
           head -40 /tmp/claude-job/prompt.md
 
       - name: Run Claude across subprojects
-        if: steps.mode.outputs.mode == 'fix'
+        if: contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_FULL: ${{ github.repository }}
@@ -480,9 +507,9 @@ jobs:
           done
 
       - name: Sensitive-path post-check across subprojects
-        if: steps.mode.outputs.mode == 'fix'
+        if: contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode)
         id: paths
-        # NOTE: keep this list in sync with build-bug-prompt.py instruction #4.
+        # NOTE: keep this list in sync with build-bug-prompt.py and build-feature-prompt.py instruction #4.
         run: |
           set -euo pipefail
           BLOCKED=""
@@ -526,7 +553,7 @@ jobs:
           fi
 
       - name: Abort if sensitive paths touched
-        if: steps.mode.outputs.mode == 'fix' && steps.paths.outputs.blocked == 'true'
+        if: contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode) && steps.paths.outputs.blocked == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_FULL: ${{ github.repository }}
@@ -547,7 +574,7 @@ jobs:
           exit 1
 
       - name: Open MR(s) on GitLab — one per modified subproject
-        if: steps.mode.outputs.mode == 'fix' && steps.paths.outputs.blocked != 'true'
+        if: contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode) && steps.paths.outputs.blocked != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHANGED_SUBS: ${{ steps.paths.outputs.changed_subs }}
@@ -555,6 +582,7 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
           ISSUE_TITLE: ${{ github.event.issue.title }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MODE: ${{ steps.mode.outputs.mode }}
         run: |
           set -euo pipefail
           POST="$SCRIPTS_DIR/post-result.sh"
@@ -563,6 +591,15 @@ jobs:
             gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/no-change-comment.md
             "$SCRIPTS_DIR/set-issue-label.sh" no-change
             exit 0
+          fi
+
+          # Commit/MR-title prefix: 'feat' for feature mode, 'fix' for bug-fix mode.
+          if [ "$MODE" = "feature" ]; then
+            COMMIT_PREFIX="feat"
+            TITLE_PREFIX="Feat"
+          else
+            COMMIT_PREFIX="fix"
+            TITLE_PREFIX="Fix"
           fi
 
           # Shared MR description (same Summary table across all MRs).
@@ -580,7 +617,7 @@ jobs:
             git config user.email "innoways-claude-bot@users.noreply.github.com"
             git checkout -b "$BRANCH"
             git add -A
-            git commit -m "fix #${ISSUE_NUMBER}: ${ISSUE_TITLE}" -m "Auto-generated by Claude. Source: ${REPO_FULL}#${ISSUE_NUMBER}. Run: ${RUN_URL}"
+            git commit -m "${COMMIT_PREFIX} #${ISSUE_NUMBER}: ${ISSUE_TITLE}" -m "Auto-generated by Claude. Source: ${REPO_FULL}#${ISSUE_NUMBER}. Run: ${RUN_URL}"
             if git push -u origin HEAD 2>/tmp/claude-job/push-${sub}.log; then
               PUSHED_SUBS="${PUSHED_SUBS}${sub} "
             else
@@ -617,7 +654,7 @@ jobs:
             glab mr create \
               --target-branch "$GITLAB_TARGET_BRANCH" \
               --source-branch "$BRANCH" \
-              --title "Fix #${ISSUE_NUMBER}: ${ISSUE_TITLE}" \
+              --title "${TITLE_PREFIX} #${ISSUE_NUMBER}: ${ISSUE_TITLE}" \
               --description "$(cat /tmp/claude-job/mr-body.md)" \
               --remove-source-branch \
               --yes > /tmp/claude-job/glab-${sub}.log 2>&1 || true
