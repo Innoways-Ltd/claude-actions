@@ -362,7 +362,7 @@ jobs:
           ISSUE_NUMBER: ${{ github.event.issue.number }}
         run: |
           set -euo pipefail
-          python3 "$SCRIPTS_DIR/build-wiki-prompt.py" > /tmp/claude-job/prompt.md
+          python3 "$SCRIPTS_DIR/build-prompt.py" --mode wiki > /tmp/claude-job/prompt.md
           echo "Prompt size: $(wc -c < /tmp/claude-job/prompt.md) bytes"
           echo "----- Prompt preview (first 40 lines) -----"
           head -40 /tmp/claude-job/prompt.md
@@ -502,13 +502,16 @@ jobs:
           MODE: ${{ steps.mode.outputs.mode }}
         run: |
           set -euo pipefail
+          # MODE is "fix" (bug) or "feature"; build-prompt.py uses "bug" for
+          # fix mode since that's the historical name of the corresponding
+          # prompt builder.
           if [ "$MODE" = "feature" ]; then
-            BUILDER="$SCRIPTS_DIR/build-feature-prompt.py"
+            PROMPT_MODE=feature
           else
-            BUILDER="$SCRIPTS_DIR/build-bug-prompt.py"
+            PROMPT_MODE=bug
           fi
-          python3 "$BUILDER" > /tmp/claude-job/prompt.md
-          echo "Prompt builder: $BUILDER"
+          python3 "$SCRIPTS_DIR/build-prompt.py" --mode "$PROMPT_MODE" > /tmp/claude-job/prompt.md
+          echo "Prompt mode: $PROMPT_MODE"
           echo "Prompt size: $(wc -c < /tmp/claude-job/prompt.md) bytes"
           echo "----- Prompt preview (first 40 lines) -----"
           head -40 /tmp/claude-job/prompt.md
@@ -564,7 +567,7 @@ jobs:
       - name: Sensitive-path post-check across subprojects
         if: contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode)
         id: paths
-        # NOTE: keep this list in sync with build-bug-prompt.py and build-feature-prompt.py instruction #4.
+        # NOTE: keep this list in sync with build-prompt.py instruction #4 (bug) / #5 (feature).
         run: |
           set -euo pipefail
           BLOCKED=""
