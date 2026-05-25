@@ -99,11 +99,78 @@ on:
         required: false
         type: string
         default: 'deployment'
-      use_legacy_flow:
-        description: "Kill switch — if true, skip project-config.yml loading entirely and use the legacy hardcoded direct_push flow (matches behavior before the configurable-terminal-action feature was added). Lets a caller roll back to the previous behavior with a single input flip."
+
+      # ──────────────────────────────────────────────────────────────────
+      # Terminal-action inputs (formerly a separate .claude/project-config.yml,
+      # inlined here so configuration lives entirely in the caller's workflow
+      # file). Defaults match the locked decisions in plan §14–§15:
+      # direct_push + fail-fast + title-then-github ticket extraction.
+      # ──────────────────────────────────────────────────────────────────
+      terminal_action:
+        description: "What happens after Claude's commit: 'direct_push' (push straight onto target_branch, casemanagement style) or 'merge_request' (push to a feature branch + open GitLab MR, membership style)."
+        required: false
+        type: string
+        default: 'direct_push'
+      on_conflict:
+        description: "direct_push only — what to do if origin/<target_branch> advanced during the run. 'fail' aborts and posts a conflict comment (locked default per plan §14). 'rebase' silently rebases Claude's commit (legacy behavior)."
+        required: false
+        type: string
+        default: 'fail'
+      branch_pattern:
+        description: "merge_request only — template for the feature-branch name. Placeholders: {base}, {ticket_num}, {github_num}, {title}, {title_clean}, {sub}, {timestamp}."
+        required: false
+        type: string
+        default: '{base}_{ticket_num}'
+      branch_on_collision:
+        description: "merge_request only — what to do when the rendered branch already exists on origin. 'append_timestamp' silently retries with -<unix> suffix; 'fail' aborts."
+        required: false
+        type: string
+        default: 'append_timestamp'
+      mr_title_template:
+        description: "merge_request only — template for the MR title. Placeholders: {ticket_num}, {title}, {github_num}, {repo}."
+        required: false
+        type: string
+        default: 'Fix #{ticket_num}: {title}'
+      mr_squash:
+        description: "merge_request only — pass --squash to glab mr create."
         required: false
         type: boolean
         default: false
+      mr_remove_source_branch:
+        description: "merge_request only — pass --remove-source-branch to glab mr create."
+        required: false
+        type: boolean
+        default: true
+      mr_assignees:
+        description: "merge_request only — space-separated GitLab usernames for --assignee."
+        required: false
+        type: string
+        default: ''
+      mr_reviewers:
+        description: "merge_request only — space-separated GitLab usernames for --reviewer."
+        required: false
+        type: string
+        default: ''
+      ticket_source_order:
+        description: "Space-separated list of sources to try for ticket-number extraction, in order. Each name is one of: 'title' (apply ticket_title_regex), 'github' (use the GitHub issue number)."
+        required: false
+        type: string
+        default: 'title github'
+      ticket_title_regex:
+        description: "Python regex with one capturing group, applied to the issue title to extract the project-internal ticket number. Default matches a leading bracketed or bare number like '[001]' or '001 - foo'."
+        required: false
+        type: string
+        default: '^\[?(\d+)\]?'
+      success_label:
+        description: "claude:* label applied to the source issue on a successful run (without the 'claude:' prefix). Typically 'pushed' for direct_push, 'mr-opened' for merge_request."
+        required: false
+        type: string
+        default: 'pushed'
+      conflict_label:
+        description: "claude:* label applied when direct_push aborts due to remote drift (on_conflict=fail)."
+        required: false
+        type: string
+        default: 'conflict'
 
 concurrency:
   # Per-project group: every project's jobs serialize on its own clones, but
@@ -133,6 +200,11 @@ jobs:
       DOCS_PATH: ${{ inputs.docs_path }}
       DOCS_INLINE: ${{ inputs.docs_inline }}
       TARGET_BRANCH: ${{ inputs.target_branch }}
+      # BASE_BRANCH is an alias for TARGET_BRANCH used by resolve-branch-name.py's
+      # {base} template placeholder. Keeping both names so the script and the
+      # downstream `git push origin HEAD:$TARGET_BRANCH` reference what they
+      # each expect without a rename refactor.
+      BASE_BRANCH: ${{ inputs.target_branch }}
       GIT_CLEAN_EXCLUDE: ${{ inputs.git_clean_exclude }}
       TARGET_PREFIX: ${{ inputs.target_prefix }}
       ENABLE_WIKI_MODE: ${{ inputs.enable_wiki_mode }}
@@ -146,7 +218,22 @@ jobs:
       # Pinned to the runner-local mirror; the first step keeps it in sync
       # with origin/${{ inputs.claude_actions_ref }} under flock.
       SCRIPTS_DIR: /home/user6/claude-actions/scripts
-      USE_LEGACY_FLOW: ${{ inputs.use_legacy_flow }}
+
+      # Terminal-action env (formerly populated from .claude/project-config.yml;
+      # now sourced directly from workflow inputs).
+      TERMINAL_ACTION: ${{ inputs.terminal_action }}
+      ON_CONFLICT: ${{ inputs.on_conflict }}
+      BRANCH_PATTERN: ${{ inputs.branch_pattern }}
+      BRANCH_ON_COLLISION: ${{ inputs.branch_on_collision }}
+      MR_TITLE_TEMPLATE: ${{ inputs.mr_title_template }}
+      MR_SQUASH: ${{ inputs.mr_squash }}
+      MR_REMOVE_SOURCE_BRANCH: ${{ inputs.mr_remove_source_branch }}
+      MR_ASSIGNEES: ${{ inputs.mr_assignees }}
+      MR_REVIEWERS: ${{ inputs.mr_reviewers }}
+      TICKET_SOURCE_ORDER: ${{ inputs.ticket_source_order }}
+      TICKET_TITLE_REGEX: ${{ inputs.ticket_title_regex }}
+      SUCCESS_LABEL: ${{ inputs.success_label }}
+      CONFLICT_LABEL: ${{ inputs.conflict_label }}
 
     steps:
       # The runner keeps a persistent mirror of this repo at
@@ -179,50 +266,31 @@ jobs:
           echo "scripts_dir=$SCRIPTS_DIR" >> "$GITHUB_OUTPUT"
           echo "Using scripts from $SCRIPTS_DIR @ $(git -C "$MIRROR" rev-parse --short HEAD)"
 
-      # ──────────────────────────────────────────────────────────────────
-      # Optional: caller-repo checkout for .claude/project-config.yml
-      #
-      # In legacy mode we skip the checkout (saves an API call, matches the
-      # pre-feature behavior exactly). When project-config support is on, we
-      # need the caller's tree so load-project-config.py can read its YAML.
-      # actions/checkout@v4 in a workflow_call context checks out the caller
-      # repo at the SHA that triggered the run, which is exactly what we want.
-      # ──────────────────────────────────────────────────────────────────
-      - name: Checkout caller repo (for project-config)
-        if: inputs.use_legacy_flow != true
-        uses: actions/checkout@v4
-        with:
-          path: caller-repo
-
-      - name: Load project config
-        if: inputs.use_legacy_flow != true
-        id: project_config
-        env:
-          DEFAULT_BASE_BRANCH: ${{ inputs.target_branch }}
+      - name: Validate terminal-action inputs
+        # Fail fast on typos / unknown enum values so a misconfigured caller
+        # surfaces the problem at job start instead of after Claude burns
+        # 30 minutes on the bug fix. Matches the validation that used to
+        # live in load-project-config.py.
         run: |
           set -euo pipefail
-          CFG="$GITHUB_WORKSPACE/caller-repo/.claude/project-config.yml"
-          # load-project-config.py writes KEY=VALUE lines (shell-quoted).
-          # Piping through `eval` so quoted values survive into the env, then
-          # forwarding the resolved values into $GITHUB_ENV for later steps.
-          # If the YAML is malformed the script exits non-zero and the run
-          # fails fast — we don't silently fall back, see plan §19.
-          OUT=$(python3 "$SCRIPTS_DIR/load-project-config.py" "$CFG" \
-                  --default-base-branch "$DEFAULT_BASE_BRANCH")
-          echo "$OUT"
-          while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            # KEY=VALUE where VALUE may be shlex-quoted. eval-then-export so
-            # the quoting unwraps correctly, then forward to GITHUB_ENV.
-            eval "$line"
-            KEY="${line%%=*}"
-            VAL="$(eval "echo \"\$$KEY\"")"
-            printf '%s<<__EOF__\n%s\n__EOF__\n' "$KEY" "$VAL" >> "$GITHUB_ENV"
-          done <<< "$OUT"
-          # Mirror BASE_BRANCH into TARGET_BRANCH so existing downstream steps
-          # (Prepare subprojects, sensitive-path check, push) keep working
-          # without renames. project-config wins over workflow input.
-          printf 'TARGET_BRANCH<<__EOF__\n%s\n__EOF__\n' "$BASE_BRANCH" >> "$GITHUB_ENV"
+          case "$TERMINAL_ACTION" in
+            direct_push|merge_request) ;;
+            *) echo "::error::terminal_action must be 'direct_push' or 'merge_request', got '$TERMINAL_ACTION'"; exit 3 ;;
+          esac
+          case "$ON_CONFLICT" in
+            fail|rebase) ;;
+            *) echo "::error::on_conflict must be 'fail' or 'rebase', got '$ON_CONFLICT'"; exit 3 ;;
+          esac
+          case "$BRANCH_ON_COLLISION" in
+            append_timestamp|fail) ;;
+            *) echo "::error::branch_on_collision must be 'append_timestamp' or 'fail', got '$BRANCH_ON_COLLISION'"; exit 3 ;;
+          esac
+          # Verify ticket_title_regex compiles (Python). Caller can't easily
+          # validate this themselves before push.
+          if ! python3 -c "import re,sys; re.compile(sys.argv[1])" "$TICKET_TITLE_REGEX" 2>/dev/null; then
+            echo "::error::ticket_title_regex is not a valid Python regex: $TICKET_TITLE_REGEX"
+            exit 3
+          fi
 
       - name: Ensure claude:* labels exist
         env:
@@ -666,7 +734,7 @@ jobs:
           contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode) &&
           steps.paths.outputs.blocked != 'true' &&
           steps.decide_push.outputs.skip_push != 'true' &&
-          (env.TERMINAL_ACTION == 'direct_push' || env.TERMINAL_ACTION == '')
+          env.TERMINAL_ACTION == 'direct_push'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHANGED_SUBS: ${{ steps.paths.outputs.changed_subs }}
@@ -685,12 +753,9 @@ jobs:
             COMMIT_PREFIX="fix"
           fi
 
-          # ON_CONFLICT comes from project-config (defaults to "fail" per plan
-          # §14 locked decision). Legacy callers (use_legacy_flow=true OR no
-          # project-config.yml present) get the empty default and we fall
-          # back to the rebase behavior to preserve historical semantics.
-          : "${ON_CONFLICT:=rebase}"
-
+          # ON_CONFLICT comes from the workflow input (default 'fail' per
+          # plan §14 locked decision). A caller that wants the prior auto-
+          # rebase behavior must explicitly pass `on_conflict: rebase`.
           PUSHED_LIST=""
           PUSH_FAILED=""
           CONFLICT_SUBS=""
