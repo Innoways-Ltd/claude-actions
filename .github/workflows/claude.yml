@@ -99,6 +99,11 @@ on:
         required: false
         type: string
         default: 'deployment'
+      use_legacy_flow:
+        description: "Kill switch — if true, skip project-config.yml loading entirely and use the legacy hardcoded direct_push flow (matches behavior before the configurable-terminal-action feature was added). Lets a caller roll back to the previous behavior with a single input flip."
+        required: false
+        type: boolean
+        default: false
 
 concurrency:
   # Per-project group: every project's jobs serialize on its own clones, but
@@ -141,6 +146,7 @@ jobs:
       # Pinned to the runner-local mirror; the first step keeps it in sync
       # with origin/${{ inputs.claude_actions_ref }} under flock.
       SCRIPTS_DIR: /home/user6/claude-actions/scripts
+      USE_LEGACY_FLOW: ${{ inputs.use_legacy_flow }}
 
     steps:
       # The runner keeps a persistent mirror of this repo at
@@ -173,12 +179,59 @@ jobs:
           echo "scripts_dir=$SCRIPTS_DIR" >> "$GITHUB_OUTPUT"
           echo "Using scripts from $SCRIPTS_DIR @ $(git -C "$MIRROR" rev-parse --short HEAD)"
 
+      # ──────────────────────────────────────────────────────────────────
+      # Optional: caller-repo checkout for .claude/project-config.yml
+      #
+      # In legacy mode we skip the checkout (saves an API call, matches the
+      # pre-feature behavior exactly). When project-config support is on, we
+      # need the caller's tree so load-project-config.py can read its YAML.
+      # actions/checkout@v4 in a workflow_call context checks out the caller
+      # repo at the SHA that triggered the run, which is exactly what we want.
+      # ──────────────────────────────────────────────────────────────────
+      - name: Checkout caller repo (for project-config)
+        if: inputs.use_legacy_flow != true
+        uses: actions/checkout@v4
+        with:
+          path: caller-repo
+
+      - name: Load project config
+        if: inputs.use_legacy_flow != true
+        id: project_config
+        env:
+          DEFAULT_BASE_BRANCH: ${{ inputs.target_branch }}
+        run: |
+          set -euo pipefail
+          CFG="$GITHUB_WORKSPACE/caller-repo/.claude/project-config.yml"
+          # load-project-config.py writes KEY=VALUE lines (shell-quoted).
+          # Piping through `eval` so quoted values survive into the env, then
+          # forwarding the resolved values into $GITHUB_ENV for later steps.
+          # If the YAML is malformed the script exits non-zero and the run
+          # fails fast — we don't silently fall back, see plan §19.
+          OUT=$(python3 "$SCRIPTS_DIR/load-project-config.py" "$CFG" \
+                  --default-base-branch "$DEFAULT_BASE_BRANCH")
+          echo "$OUT"
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            # KEY=VALUE where VALUE may be shlex-quoted. eval-then-export so
+            # the quoting unwraps correctly, then forward to GITHUB_ENV.
+            eval "$line"
+            KEY="${line%%=*}"
+            VAL="$(eval "echo \"\$$KEY\"")"
+            printf '%s<<__EOF__\n%s\n__EOF__\n' "$KEY" "$VAL" >> "$GITHUB_ENV"
+          done <<< "$OUT"
+          # Mirror BASE_BRANCH into TARGET_BRANCH so existing downstream steps
+          # (Prepare subprojects, sensitive-path check, push) keep working
+          # without renames. project-config wins over workflow input.
+          printf 'TARGET_BRANCH<<__EOF__\n%s\n__EOF__\n' "$BASE_BRANCH" >> "$GITHUB_ENV"
+
       - name: Ensure claude:* labels exist
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO_FULL: ${{ github.repository }}
         run: |
-          for state in pushed no-change blocked run-failed answered; do
+          # All status labels we ever set across direct_push, merge_request,
+          # and wiki modes. --force is idempotent on existing labels.
+          for state in pushed no-change blocked run-failed answered mr-opened conflict; do
             gh label create "claude:$state" \
               --repo "$REPO_FULL" \
               --description "Auto-set by Claude workflow" \
@@ -575,8 +628,45 @@ jobs:
           "$SCRIPTS_DIR/set-issue-label.sh" blocked
           exit 1
 
-      - name: Commit & push directly to target branch — one per modified subproject
+      # ══════════════════════════════════════════════════════════════════
+      # Terminal action — direct_push OR merge_request
+      #
+      # Selected by env TERMINAL_ACTION (set by Load project config; defaults
+      # to direct_push if no project-config.yml was provided). Each branch
+      # owns its own commit/push/comment/label sequence; the no-change short-
+      # circuit lives in a shared "Decide push fate" step run first.
+      # ══════════════════════════════════════════════════════════════════
+
+      - name: Decide push fate (no-change short-circuit)
         if: contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode) && steps.paths.outputs.blocked != 'true'
+        id: decide_push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANGED_SUBS: ${{ steps.paths.outputs.changed_subs }}
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          POST="$SCRIPTS_DIR/post-result.sh"
+          if [ -z "$CHANGED_SUBS" ]; then
+            "$POST" issue_no_chg "$RUN_URL" > /tmp/claude-job/no-change-comment.md
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/no-change-comment.md
+            "$SCRIPTS_DIR/set-issue-label.sh" no-change
+            echo "skip_push=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "skip_push=false" >> "$GITHUB_OUTPUT"
+
+      # ──────────────────────────────────────────────────────────────────
+      # direct_push path — casemanagement style
+      # ──────────────────────────────────────────────────────────────────
+      - name: Commit & push directly to target branch — one per modified subproject
+        if: |
+          contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode) &&
+          steps.paths.outputs.blocked != 'true' &&
+          steps.decide_push.outputs.skip_push != 'true' &&
+          (env.TERMINAL_ACTION == 'direct_push' || env.TERMINAL_ACTION == '')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CHANGED_SUBS: ${{ steps.paths.outputs.changed_subs }}
@@ -588,12 +678,6 @@ jobs:
         run: |
           set -euo pipefail
           POST="$SCRIPTS_DIR/post-result.sh"
-          if [ -z "$CHANGED_SUBS" ]; then
-            "$POST" issue_no_chg "$RUN_URL" > /tmp/claude-job/no-change-comment.md
-            gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/no-change-comment.md
-            "$SCRIPTS_DIR/set-issue-label.sh" no-change
-            exit 0
-          fi
 
           if [ "$MODE" = "feature" ]; then
             COMMIT_PREFIX="feat"
@@ -601,27 +685,41 @@ jobs:
             COMMIT_PREFIX="fix"
           fi
 
-          # PUSHED_LIST holds "sub|sha" entries, one per line.
+          # ON_CONFLICT comes from project-config (defaults to "fail" per plan
+          # §14 locked decision). Legacy callers (use_legacy_flow=true OR no
+          # project-config.yml present) get the empty default and we fall
+          # back to the rebase behavior to preserve historical semantics.
+          : "${ON_CONFLICT:=rebase}"
+
           PUSHED_LIST=""
           PUSH_FAILED=""
+          CONFLICT_SUBS=""
           for sub in $CHANGED_SUBS; do
             cd "$WORKSPACE_ROOT/${sub}"
             git config user.name  "innoways-claude-bot[bot]"
             git config user.email "innoways-claude-bot@users.noreply.github.com"
 
-            # We're already on $TARGET_BRANCH (set by "Prepare subprojects").
-            # Stage Claude's edits, commit, then rebase onto the latest remote
-            # tip so we fast-forward if a human pushed to the branch mid-run.
             git add -A
             git commit -m "${COMMIT_PREFIX} #${ISSUE_NUMBER}: ${ISSUE_TITLE}" \
                        -m "Auto-generated by Claude. Source: ${REPO_FULL}#${ISSUE_NUMBER}. Run: ${RUN_URL}"
 
-            git fetch origin "$TARGET_BRANCH"
-            if ! git rebase "origin/$TARGET_BRANCH"; then
-              git rebase --abort || true
-              PUSH_FAILED="${PUSH_FAILED}${sub}(rebase-conflict) "
-              echo "::error::${sub}: rebase onto origin/$TARGET_BRANCH had conflicts"
-              continue
+            if [ "$ON_CONFLICT" = "fail" ]; then
+              # Plan §14 locked decision: refuse to rebase Claude's commit onto
+              # unknown work. If origin/$TARGET_BRANCH advanced, abort this sub.
+              if ! "$SCRIPTS_DIR/precheck-remote-base.sh" "$WORKSPACE_ROOT/${sub}" "$TARGET_BRANCH"; then
+                CONFLICT_SUBS="${CONFLICT_SUBS}${sub} "
+                echo "::warning::${sub}: remote moved during run; aborting per on_conflict=fail"
+                continue
+              fi
+            else
+              # Legacy rebase behavior (on_conflict=rebase or unset).
+              git fetch origin "$TARGET_BRANCH"
+              if ! git rebase "origin/$TARGET_BRANCH"; then
+                git rebase --abort || true
+                PUSH_FAILED="${PUSH_FAILED}${sub}(rebase-conflict) "
+                echo "::error::${sub}: rebase onto origin/$TARGET_BRANCH had conflicts"
+                continue
+              fi
             fi
 
             if git push origin "HEAD:$TARGET_BRANCH" 2>/tmp/claude-job/push-${sub}.log; then
@@ -636,8 +734,23 @@ jobs:
 
           printf '%s' "$PUSHED_LIST" > /tmp/claude-job/pushed-list.txt
 
-          if [ -n "$PUSH_FAILED" ]; then
-            "$POST" issue_push_failed "$RUN_URL" "${PUSH_FAILED% }" /tmp/claude-job/pushed-list.txt \
+          # If ALL failures are remote-advanced (fail-fast collisions), emit
+          # the dedicated conflict comment and set claude:conflict so the
+          # operator knows exactly what happened. Mixed failures fall through
+          # to the generic push_failed comment.
+          if [ -n "$CONFLICT_SUBS" ] && [ -z "$PUSH_FAILED" ] && [ -z "$PUSHED_LIST" ]; then
+            "$POST" issue_conflict "$RUN_URL" "$TARGET_BRANCH" "${CONFLICT_SUBS% }" \
+              > /tmp/claude-job/conflict.md
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/conflict.md
+            "$SCRIPTS_DIR/set-issue-label.sh" --label "${CONFLICT_LABEL:-conflict}"
+            exit 1
+          fi
+
+          # Mixed-failure or pure-push-failure case: surface what failed +
+          # which subs already pushed (those can't be rolled back).
+          FAILED_ALL="${PUSH_FAILED}${CONFLICT_SUBS}"
+          if [ -n "$FAILED_ALL" ]; then
+            "$POST" issue_push_failed "$RUN_URL" "${FAILED_ALL% }" /tmp/claude-job/pushed-list.txt \
               "$TARGET_BRANCH" \
               > /tmp/claude-job/push-failed.md
             gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/push-failed.md
@@ -648,7 +761,190 @@ jobs:
           "$POST" issue_pushed_multi /tmp/claude-job/pushed-list.txt "$TARGET_BRANCH" \
             > /tmp/claude-job/issue-comment.md
           gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/issue-comment.md
-          "$SCRIPTS_DIR/set-issue-label.sh" pushed
+          "$SCRIPTS_DIR/set-issue-label.sh" --label "${SUCCESS_LABEL:-pushed}"
+
+      # ──────────────────────────────────────────────────────────────────
+      # merge_request path — membership style
+      # ──────────────────────────────────────────────────────────────────
+      - name: Branch + push + open MR — one per modified subproject
+        if: |
+          contains(fromJSON('["fix","feature"]'), steps.mode.outputs.mode) &&
+          steps.paths.outputs.blocked != 'true' &&
+          steps.decide_push.outputs.skip_push != 'true' &&
+          env.TERMINAL_ACTION == 'merge_request'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CHANGED_SUBS: ${{ steps.paths.outputs.changed_subs }}
+          REPO_FULL: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          set -euo pipefail
+          POST="$SCRIPTS_DIR/post-result.sh"
+
+          if [ "$MODE" = "feature" ]; then
+            COMMIT_PREFIX="feat"
+          else
+            COMMIT_PREFIX="fix"
+          fi
+
+          # Resolve ticket_num once for the whole run (same value across all
+          # subs — the branch may use {sub} to disambiguate).
+          export TICKET_NUM=$(python3 "$SCRIPTS_DIR/resolve-ticket-number.py")
+
+          # Shared MR description — write once, reuse for all MRs (Summary
+          # table is identical across subprojects).
+          "$POST" mr_body "$REPO_FULL" "$ISSUE_NUMBER" "$RUN_URL" \
+            > /tmp/claude-job/mr-body.md
+
+          # Phase 1: branch + commit + push per sub. Push failures here are
+          # pre-MR so we can abort without leaving orphan MRs around.
+          PUSHED_SUBS=""
+          PUSH_FAILED=""
+          declare -A SUB_BRANCH
+          for sub in $CHANGED_SUBS; do
+            cd "$WORKSPACE_ROOT/${sub}"
+            git config user.name  "innoways-claude-bot[bot]"
+            git config user.email "innoways-claude-bot@users.noreply.github.com"
+
+            # Resolve branch name per-sub (template may use {sub}).
+            BRANCH=$(SUB="$sub" COLLISION_CHECK_PATH="$WORKSPACE_ROOT/${sub}" \
+              python3 "$SCRIPTS_DIR/resolve-branch-name.py")
+            SUB_BRANCH[$sub]="$BRANCH"
+
+            git checkout -b "$BRANCH"
+            git add -A
+            git commit -m "${COMMIT_PREFIX} #${ISSUE_NUMBER}: ${ISSUE_TITLE}" \
+                       -m "Auto-generated by Claude. Source: ${REPO_FULL}#${ISSUE_NUMBER}. Run: ${RUN_URL}"
+
+            if git push -u origin HEAD 2>/tmp/claude-job/push-${sub}.log; then
+              PUSHED_SUBS="${PUSHED_SUBS}${sub} "
+            else
+              PUSH_FAILED="${PUSH_FAILED}${sub} "
+              echo "::error::git push failed for ${sub}"
+              cat /tmp/claude-job/push-${sub}.log
+              break
+            fi
+          done
+
+          if [ -n "$PUSH_FAILED" ]; then
+            {
+              printf 'Claude run failed: git push failed for **%s**.\n\n' "${PUSH_FAILED% }"
+              if [ -n "$PUSHED_SUBS" ]; then
+                printf 'Branches already pushed (no MR opened, safe to delete):\n'
+                for s in $PUSHED_SUBS; do
+                  printf -- '- `%s` on %s\n' "${SUB_BRANCH[$s]}" "$s"
+                done
+                printf '\n'
+              fi
+              printf 'No MR opened. [Run log](%s)\n' "$RUN_URL"
+            } > /tmp/claude-job/push-failed.md
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/push-failed.md
+            "$SCRIPTS_DIR/set-issue-label.sh" run-failed
+            exit 1
+          fi
+
+          # Phase 2: open one MR per pushed sub. We deliberately don't break
+          # on the first glab failure — surface every successful MR plus a
+          # clear note of which subs failed.
+          MR_LIST=""
+          MR_FAILED=""
+          # MR title template comes from project-config (default applied by
+          # load-project-config.py).
+          for sub in $PUSHED_SUBS; do
+            cd "$WORKSPACE_ROOT/${sub}"
+            BRANCH="${SUB_BRANCH[$sub]}"
+            # Render MR title via the standalone helper (keeps the workflow
+            # YAML parseable — embedded multi-line Python broke it).
+            MR_TITLE=$(TEMPLATE="${MR_TITLE_TEMPLATE:-Fix #{ticket_num}: {title}}" \
+              python3 "$SCRIPTS_DIR/render-template.py")
+
+            GLAB_ARGS=(
+              "mr" "create"
+              "--target-branch" "$TARGET_BRANCH"
+              "--source-branch" "$BRANCH"
+              "--title" "$MR_TITLE"
+              "--description" "$(cat /tmp/claude-job/mr-body.md)"
+              "--yes"
+            )
+            if [ "${MR_REMOVE_SOURCE_BRANCH:-true}" = "true" ]; then
+              GLAB_ARGS+=("--remove-source-branch")
+            fi
+            if [ "${MR_SQUASH:-false}" = "true" ]; then
+              GLAB_ARGS+=("--squash")
+            fi
+            # Assignees / reviewers are space-separated lists; expand only if non-empty.
+            if [ -n "${MR_ASSIGNEES:-}" ]; then
+              for u in $MR_ASSIGNEES; do GLAB_ARGS+=("--assignee" "$u"); done
+            fi
+            if [ -n "${MR_REVIEWERS:-}" ]; then
+              for u in $MR_REVIEWERS; do GLAB_ARGS+=("--reviewer" "$u"); done
+            fi
+
+            glab "${GLAB_ARGS[@]}" > /tmp/claude-job/glab-${sub}.log 2>&1 || true
+            MR_URL=$(grep -Eo 'https://[^ ]+/-/merge_requests/[0-9]+' /tmp/claude-job/glab-${sub}.log | head -1)
+            if [ -z "$MR_URL" ]; then
+              echo "::warning::glab mr create did not return a URL for ${sub}"
+              cat /tmp/claude-job/glab-${sub}.log
+              MR_FAILED="${MR_FAILED}${sub} "
+            else
+              MR_LIST="${MR_LIST}${sub}|${MR_URL}"$'\n'
+            fi
+          done
+
+          printf '%s' "$MR_LIST" > /tmp/claude-job/mr-list.txt
+
+          # Cross-reference when 2+ MRs opened (must be merged together).
+          MR_COUNT=$(printf '%s' "$MR_LIST" | grep -c '|' || true)
+          if [ "$MR_COUNT" -ge 2 ]; then
+            cp /tmp/claude-job/mr-body.md /tmp/claude-job/mr-body-augmented.md
+            {
+              echo ''
+              echo '---'
+              echo ''
+              echo '**Related MRs from this run — must be merged together:**'
+              echo ''
+              while IFS='|' read -r sub url; do
+                [ -z "$sub" ] && continue
+                printf -- '- `%s` → %s\n' "$sub" "$url"
+              done < /tmp/claude-job/mr-list.txt
+            } >> /tmp/claude-job/mr-body-augmented.md
+            while IFS='|' read -r sub url; do
+              [ -z "$sub" ] && continue
+              MR_NUM=$(echo "$url" | grep -oE '[0-9]+$')
+              cd "$WORKSPACE_ROOT/${sub}"
+              glab mr update "$MR_NUM" \
+                --description "$(cat /tmp/claude-job/mr-body-augmented.md)" \
+                > /tmp/claude-job/glab-update-${sub}.log 2>&1 \
+                || echo "::warning::Failed to add cross-refs to ${sub} MR ${MR_NUM}"
+            done < /tmp/claude-job/mr-list.txt
+          fi
+
+          if [ -n "$MR_LIST" ]; then
+            "$POST" issue_mr_multi /tmp/claude-job/mr-list.txt "$TARGET_BRANCH" \
+              > /tmp/claude-job/issue-comment.md
+          else
+            echo '**Claude pushed branches but no MR could be opened on GitLab.**' \
+              > /tmp/claude-job/issue-comment.md
+            echo '' >> /tmp/claude-job/issue-comment.md
+          fi
+          if [ -n "$MR_FAILED" ]; then
+            {
+              echo ''
+              echo '> :warning: glab mr create failed for: **'"${MR_FAILED% }"'**'
+              echo '>'
+              echo '> Branches were pushed; admin should open the MR manually or rerun.'
+            } >> /tmp/claude-job/issue-comment.md
+          fi
+          gh issue comment "$ISSUE_NUMBER" --repo "$REPO_FULL" --body-file /tmp/claude-job/issue-comment.md
+
+          if [ -n "$MR_FAILED" ]; then
+            "$SCRIPTS_DIR/set-issue-label.sh" run-failed
+            exit 1
+          fi
+          "$SCRIPTS_DIR/set-issue-label.sh" --label "${SUCCESS_LABEL:-mr-opened}"
 
       # ──────────────────────────────────────────────────────────────────
       # Telemetry (always)
