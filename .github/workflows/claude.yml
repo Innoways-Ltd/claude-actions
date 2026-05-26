@@ -926,7 +926,12 @@ jobs:
             BRANCH="${SUB_BRANCH[$sub]}"
             # Render MR title via the standalone helper (keeps the workflow
             # YAML parseable — embedded multi-line Python broke it).
-            MR_TITLE=$(TEMPLATE="${MR_TITLE_TEMPLATE:-Fix #{ticket_num}: {title}}" \
+            # Default lives in render-template.py, NOT here: bash's
+            # ${var:-default} splits the default at the first '}', so
+            # "Fix #{ticket_num}: {title}" would be mangled before Python
+            # ever sees it (the trailing '}' ends up doubled, producing
+            # ValueError: Single '}' encountered in format string).
+            MR_TITLE=$(TEMPLATE="$MR_TITLE_TEMPLATE" \
               python3 "$SCRIPTS_DIR/render-template.py")
 
             GLAB_ARGS=(
