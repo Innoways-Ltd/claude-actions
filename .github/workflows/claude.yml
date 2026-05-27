@@ -414,13 +414,21 @@ jobs:
         # prints "Already up to date" when HEAD has not moved, so this step
         # is near-free on no-op runs.
         #
+        # `--index-only` is critical: without it, `gitnexus analyze` rewrites
+        # each repo's CLAUDE.md + AGENTS.md and installs `.claude/skills/
+        # gitnexus/`. Claude then auto-loads the polluted CLAUDE.md at
+        # startup, which (a) busts the prompt cache every run, (b) bloats the
+        # context, and (c) injects gitnexus tool guidance that makes Claude
+        # over-explore via MCP. One observed run ballooned from 10m to 24m.
+        # See https://github.com/Innoways-Ltd/claude-actions/pull/9.
+        #
         # Soft-fail: a broken index must not block the run. The fallback
         # policy in build-prompt.py's GitNexus section tells Claude to fall
         # back to Read/Grep if MCP tools error or look stale.
         #
         # Skips silently when `.gitnexus/` is absent — bootstrap is a one-time
-        # operator step (`gitnexus analyze <path>` in the subproject) rather
-        # than a workflow concern.
+        # operator step (`gitnexus analyze --index-only <path>` in the
+        # subproject) rather than a workflow concern.
         env:
           LOG_FILE: /home/user6/claude-runner-logs/gitnexus-${{ inputs.project_name }}.log
         run: |
@@ -432,15 +440,18 @@ jobs:
           } >> "$LOG_FILE"
           for sub in $SUBPROJECTS; do
             if [ ! -d "$WORKSPACE_ROOT/${sub}/.gitnexus" ]; then
-              echo "::notice::${sub}: no .gitnexus/ index — skipping (bootstrap with: gitnexus analyze $WORKSPACE_ROOT/${sub})"
+              echo "::notice::${sub}: no .gitnexus/ index — skipping (bootstrap with: gitnexus analyze --index-only $WORKSPACE_ROOT/${sub})"
               continue
             fi
             echo "----- ${sub} -----" >> "$LOG_FILE"
             # flock per-subproject lets the 3 subprojects index serially with
             # no cross-project contention; -n means bail (don't queue) if the
             # lock is held by a parallel job — that job will catch up later.
+            #
+            # --index-only: refresh ONLY .gitnexus/; do not touch CLAUDE.md,
+            # AGENTS.md, or .claude/skills/. See the comment block above.
             if ! flock -n "/tmp/gn-${sub}.lock" \
-                /home/user6/.local/bin/gitnexus analyze "$WORKSPACE_ROOT/${sub}" \
+                /home/user6/.local/bin/gitnexus analyze --index-only "$WORKSPACE_ROOT/${sub}" \
                 >> "$LOG_FILE" 2>&1; then
               echo "::warning::${sub}: gitnexus reindex failed or lock held — continuing with whatever index is on disk"
             fi
