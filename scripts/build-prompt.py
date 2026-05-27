@@ -8,8 +8,9 @@ sections emitted depend on --mode:
   bug      Tester issue framing + Summary table at end; docs section if DOCS_PATH set
   feature  Feature-request framing + extracted "Acceptance criteria" section
            + Summary table; allows new files / small abstractions
-  wiki     Read-only Q&A framing + GitNexus MCP intro + Answer template;
-           no code modification, jargon-banned
+  wiki     Read-only Q&A framing + Answer template; no code modification, jargon-banned
+
+All modes get the GitNexus MCP intro when GITNEXUS_REPOS is non-empty.
 
 Replaces the prior trio of build-bug-prompt.py / build-feature-prompt.py /
 build-wiki-prompt.py, which were ~80% duplicated.
@@ -23,8 +24,8 @@ Additional required env for bug + feature modes:
 Optional env:
   DOCS_PATH                  bug/feature: subdir under WORKSPACE_ROOT for docs
   DOCS_INLINE                bug/feature: space-separated docs to inline
-  GITNEXUS_REPOS             wiki: repos indexed in GitNexus (defaults to SUBPROJECTS;
-                             pass ' ' to disable the GitNexus section)
+  GITNEXUS_REPOS             repos indexed in GitNexus (defaults to SUBPROJECTS;
+                             pass ' ' to disable the GitNexus section in all modes)
 """
 from __future__ import annotations
 
@@ -117,14 +118,14 @@ def _load_context(mode: str) -> dict[str, Any]:
             else ""
         )
 
-    if mode == MODE_WIKI:
-        # GITNEXUS_REPOS defaults to SUBPROJECTS. An explicit ' ' (whitespace)
-        # value parses to an empty list and disables the GitNexus section for
-        # projects without an index.
-        raw = os.environ.get("GITNEXUS_REPOS")
-        ctx["gitnexus_repos"] = (
-            ctx["subprojects"] if raw is None else raw.split()
-        )
+    # GITNEXUS_REPOS defaults to SUBPROJECTS. An explicit ' ' (whitespace)
+    # value parses to an empty list and disables the GitNexus section for
+    # projects without an index. Loaded for every mode (wiki, bug, feature) —
+    # the workflow's `Reindex gitnexus` step refreshes the index per run.
+    raw = os.environ.get("GITNEXUS_REPOS")
+    ctx["gitnexus_repos"] = (
+        ctx["subprojects"] if raw is None else raw.split()
+    )
 
     return ctx
 
@@ -242,8 +243,13 @@ def _section_docs(ctx: dict[str, Any], mode: str) -> list[str]:
     return lines
 
 
-def _section_gitnexus(ctx: dict[str, Any]) -> list[str]:
-    """GitNexus MCP intro for wiki mode (omitted if GITNEXUS_REPOS is empty)."""
+def _section_gitnexus(ctx: dict[str, Any], mode: str) -> list[str]:
+    """GitNexus MCP intro (omitted if GITNEXUS_REPOS is empty).
+
+    Emitted for every mode. The "do not surface code paths" rule is wiki-only:
+    bug and feature modes are required to list concrete file paths in their
+    Summary table, so for those modes we tell Claude the opposite.
+    """
     repos = ctx["gitnexus_repos"]
     if not repos:
         return []
@@ -253,8 +259,9 @@ def _section_gitnexus(ctx: dict[str, Any]) -> list[str]:
         "",
         (
             "A pre-indexed code graph is available via `mcp__gitnexus__*` tools. "
-            "It is incrementally refreshed every 4 hours, so use it **before** "
-            "falling back to Read/Grep on the source tree."
+            "It is refreshed at the start of every workflow run (no-op when HEAD "
+            "hasn't moved), so use it **before** falling back to Read/Grep on the "
+            "source tree."
         ),
         "",
     ]
@@ -268,12 +275,20 @@ def _section_gitnexus(ctx: dict[str, Any]) -> list[str]:
     for r in repos:
         lines.append(f'- `repo: "{r}"`')
     lines.append("")
-    lines.append(
-        "Use these tools **internally to find and verify** the answer — "
-        "but **do not surface code paths, function names, or file references "
-        "in the final answer**. They are for your reasoning, not for the "
-        "reader (see Instructions §2 below)."
-    )
+    if mode == MODE_WIKI:
+        lines.append(
+            "Use these tools **internally to find and verify** the answer — "
+            "but **do not surface code paths, function names, or file references "
+            "in the final answer**. They are for your reasoning, not for the "
+            "reader (see Instructions §2 below)."
+        )
+    else:
+        lines.append(
+            "Use these tools to locate the file(s) you'll change and trace their "
+            "callers/callees before editing. The `## Summary` table at the end "
+            "MUST list concrete file paths — gitnexus is the fastest way to find "
+            "the right paths."
+        )
     lines.append("")
     lines.append(
         "- `mcp__gitnexus__query({query, repo})` — semantic + symbol search; "
@@ -292,17 +307,25 @@ def _section_gitnexus(ctx: dict[str, Any]) -> list[str]:
         "the above are too coarse."
     )
     lines.append("")
-    if len(repos) > 1:
+    if len(repos) > 1 and mode == MODE_WIKI:
         lines.append(
             "If a question spans multiple repos (e.g. an API contract), query each "
             "in turn and synthesise the *business behaviour* — never paste "
             "code paths into the answer."
         )
         lines.append("")
+    elif len(repos) > 1:
+        lines.append(
+            "If the fix spans multiple repos (e.g. a frontend request shape "
+            "paired with a backend handler), query each repo separately and "
+            "use `impact` to confirm you've found every call site."
+        )
+        lines.append("")
     lines.append(
         "**Fallback policy:** if any gitnexus tool errors, returns nothing, "
-        "or the index looks stale, fall back silently to Read/Grep. Do not "
-        "surface MCP errors in the final answer to the user."
+        "or the index looks stale (e.g. it names a file you can't Read on "
+        "disk), fall back silently to Read/Grep — trust the disk over the "
+        "index. Do not surface MCP errors in the final answer to the user."
     )
     lines.append("")
     return lines
@@ -625,8 +648,7 @@ def _build_prompt(ctx: dict[str, Any], mode: str) -> list[str]:
     lines += _section_workspace(ctx, mode)
     if mode in (MODE_BUG, MODE_FEATURE):
         lines += _section_docs(ctx, mode)
-    if mode == MODE_WIKI:
-        lines += _section_gitnexus(ctx)
+    lines += _section_gitnexus(ctx, mode)
     lines += _section_issue_body(ctx, mode)
     if mode == MODE_FEATURE:
         lines += _section_acceptance(ctx)
