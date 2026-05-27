@@ -244,6 +244,8 @@ def test_wiki_mode_gitnexus_section_present(install_issue_json: None) -> None:
     assert '`repo: "CaseManagement-NodeJs"`' in out
     assert '`repo: "casemanagement-react"`' in out
     assert "Fallback policy" in out
+    # Wiki mode uniquely tells Claude NOT to surface code paths in the answer.
+    assert "do not surface code paths" in out
 
 
 def test_wiki_mode_no_gitnexus_when_disabled(install_issue_json: None) -> None:
@@ -253,6 +255,45 @@ def test_wiki_mode_no_gitnexus_when_disabled(install_issue_json: None) -> None:
     out = r.stdout
     assert "## Code intelligence" not in out
     assert "mcp__gitnexus__query" not in out
+
+
+# ────────────────────────────────────────────────────────────────────────────
+# Gitnexus injection in bug/feature modes
+# ────────────────────────────────────────────────────────────────────────────
+
+def test_bug_mode_gitnexus_section_present(install_issue_json: None) -> None:
+    """GitNexus MCP section is also emitted in bug mode (default GITNEXUS_REPOS)."""
+    r = _run("bug", {})
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "## Code intelligence (GitNexus MCP — preferred)" in out
+    assert "mcp__gitnexus__query" in out
+    assert '`repo: "CaseManagement-NodeJs"`' in out
+    # Bug mode REQUIRES file paths in Summary — the wiki "don't surface" rule
+    # must not appear, and the bug-mode replacement guidance must.
+    assert "do not surface code paths" not in out
+    assert "Summary` table at the end" in out
+
+
+def test_feature_mode_gitnexus_section_present(install_issue_json: None) -> None:
+    """GitNexus MCP section is also emitted in feature mode."""
+    r = _run("feature", {})
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "## Code intelligence (GitNexus MCP — preferred)" in out
+    assert "mcp__gitnexus__query" in out
+    assert "do not surface code paths" not in out
+
+
+def test_bug_mode_no_gitnexus_when_disabled(install_issue_json: None) -> None:
+    """`GITNEXUS_REPOS=' '` disables the section in bug mode too."""
+    r = _run("bug", {"GITNEXUS_REPOS": " "})
+    assert r.returncode == 0, r.stderr
+    out = r.stdout
+    assert "## Code intelligence" not in out
+    assert "mcp__gitnexus__query" not in out
+    # Rest of the bug prompt is intact.
+    assert "## Summary" in out
 
 
 def test_wiki_mode_jargon_ban_in_instructions(install_issue_json: None) -> None:
