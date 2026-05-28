@@ -56,6 +56,11 @@ on:
         required: false
         type: string
         default: 'dev'
+      source_branch:
+        description: "Branch Claude checks out from to start work. Defaults to target_branch when empty. Use this when the MR base branch differs from the working baseline, e.g. source_branch=pre_test, target_branch=dev."
+        required: false
+        type: string
+        default: ''
       git_clean_exclude:
         description: "Pattern passed to 'git clean -e' (e.g. '.gitnexus'). Empty = no exclusion."
         required: false
@@ -205,6 +210,10 @@ jobs:
       # downstream `git push origin HEAD:$TARGET_BRANCH` reference what they
       # each expect without a rename refactor.
       BASE_BRANCH: ${{ inputs.target_branch }}
+      # Source branch — where the workspace is checked out from. Falls back to
+      # TARGET_BRANCH when caller doesn't override it, preserving the legacy
+      # coupling for projects that don't separate these concepts.
+      SOURCE_BRANCH: ${{ inputs.source_branch != '' && inputs.source_branch || inputs.target_branch }}
       GIT_CLEAN_EXCLUDE: ${{ inputs.git_clean_exclude }}
       TARGET_PREFIX: ${{ inputs.target_prefix }}
       ENABLE_WIKI_MODE: ${{ inputs.enable_wiki_mode }}
@@ -392,8 +401,8 @@ jobs:
               git clean $CLEAN_ARGS || true
             fi
             git fetch origin
-            git checkout "$TARGET_BRANCH"
-            git reset --hard "origin/$TARGET_BRANCH"
+            git checkout "$SOURCE_BRANCH"
+            git reset --hard "origin/$SOURCE_BRANCH"
             git clean $CLEAN_ARGS
             # Prune any leftover claude/* branches from the pre-direct-push era
             # (when each run created a side branch and opened an MR). Cheap
